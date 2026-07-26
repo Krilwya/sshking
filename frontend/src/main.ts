@@ -68,7 +68,7 @@ const icons = {
 
 const demoConfig: Config = {
   servers: [
-    { id: "demo-1", name: "Production", host: "api.northstar.dev", port: 22, user: "deploy", shell: "zsh", favorite: true, passwordSaved: true, requireBiometric: true },
+    { id: "demo-1", name: "Production", host: "api.northstar.dev", port: 22, user: "deploy", shell: "zsh", identity: "~/.ssh/id_ed25519", favorite: true, passwordSaved: true, requireBiometric: true },
     { id: "demo-2", name: "Staging", host: "stage.northstar.dev", port: 22, user: "ubuntu", shell: "bash", favorite: true },
     { id: "demo-3", name: "Home lab", host: "192.168.1.42", port: 22, user: "operator", shell: "fish" },
   ],
@@ -94,6 +94,7 @@ const state = {
   modal: "" as "" | "server" | "settings" | "connect" | "zed" | "ssh-key" | "trust-host-key",
   editingId: "",
   sshKeys: [] as PublicKeyInfo[],
+  remotePaths: {} as Record<string, string>,
   biometricAvailable: false,
   biometricName: "Device authentication",
   pendingConnection: null as ConnectionRequest | null,
@@ -115,12 +116,15 @@ function backend(name: string, ...args: unknown[]): Promise<any> {
 }
 
 async function mockBackend(name: string, args: unknown[]) {
-  if (name === "GetState") return {
-    config: demoConfig,
-    platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "windows",
-    biometricAvailable: true,
-    biometricName: navigator.platform.toLowerCase().includes("mac") ? "Touch ID" : "Windows Hello",
-  };
+  if (name === "GetState") {
+    state.remotePaths["demo-1"] = "/srv/northstar";
+    return {
+      config: demoConfig,
+      platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "windows",
+      biometricAvailable: true,
+      biometricName: navigator.platform.toLowerCase().includes("mac") ? "Touch ID" : "Windows Hello",
+    };
+  }
   if (name === "SaveServer") {
     const server = args[0] as Server;
     if (!server.id) server.id = `demo-${Date.now()}`;
@@ -213,7 +217,10 @@ function render() {
             </div>
             <div class="toolbar-actions">
               <button class="key-button" id="setup-key" ${selected ? "" : "disabled"} aria-label="Set up SSH key">${icons.key}<span>Key</span></button>
-              <button class="zed-button" id="open-zed" ${selected ? "" : "disabled"} aria-label="Open in Zed">${icons.code}<span>Zed</span></button>
+              <div class="zed-split">
+                <button class="zed-button" id="open-zed-direct" ${selected ? "" : "disabled"} aria-label="Open current folder in Zed">${icons.code}<span>Zed</span></button>
+                <button class="zed-options" id="open-zed-options" ${selected ? "" : "disabled"} aria-label="Zed options">${icons.more}</button>
+              </div>
               <button class="icon-button" id="edit-server" ${selected ? "" : "disabled"} aria-label="Edit server">${icons.more}</button>
               <button class="connect-button ${state.connection === "connected" ? "connected" : ""}" id="connect-button" ${selected ? "" : "disabled"}>
                 <span>${state.connection === "connected" ? "Disconnect" : state.connection === "connecting" ? "Connecting…" : "Connect"}</span>
@@ -301,8 +308,9 @@ function modalMarkup() {
       <div class="modal-handle"></div>
       <div class="modal-header"><div><span class="eyebrow">Remote editing</span><h2>Open in Zed</h2></div><button type="button" class="modal-close">×</button></div>
       <p class="modal-note">Open a remote file or folder on <strong>${escapeHtml(selected?.name ?? "this server")}</strong>. Zed normally uses your system SSH agent or configured keys. Passing the saved password is optional and less secure.</p>
-      <label class="form-field"><span>Remote path</span><input name="remotePath" value="~" placeholder="~/project or /etc/nginx/nginx.conf" autocomplete="off" spellcheck="false" required></label>
+      <label class="form-field"><span>Remote path</span><input name="remotePath" value="${escapeHtml(currentRemotePath())}" placeholder="~/project or /etc/nginx/nginx.conf" autocomplete="off" spellcheck="false" required></label>
       <div class="zed-destination">${escapeHtml(selected ? `${selected.user}@${selected.host}:${selected.port}` : "")}</div>
+      ${selected?.identity ? `<div class="zed-key-status">${icons.key}<span>Using private key <strong>${escapeHtml(selected.identity)}</strong></span></div>` : ""}
       <label class="switch-row zed-window-option">
         <span><strong>Open in a new window</strong><small>Keep the remote project separate from existing Zed workspaces</small></span>
         <input name="newWindow" type="checkbox" checked><i></i>
@@ -410,7 +418,8 @@ function bindEvents() {
     openModal("server");
   });
   document.querySelector("#setup-key")?.addEventListener("click", openSSHKeyModal);
-  document.querySelector("#open-zed")?.addEventListener("click", () => {
+  document.querySelector("#open-zed-direct")?.addEventListener("click", openCurrentFolderInZed);
+  document.querySelector("#open-zed-options")?.addEventListener("click", () => {
     state.modal = "zed";
     render();
     setTimeout(() => document.querySelector<HTMLInputElement>('input[name="remotePath"]')?.select(), 20);
@@ -588,6 +597,17 @@ async function openInZed(event: SubmitEvent) {
   render();
 }
 
+async function openCurrentFolderInZed() {
+  const remotePath = currentRemotePath();
+  try {
+    await backend("OpenInZed", state.selectedId, remotePath, true, false);
+    pushOutput({ kind: "success", text: `Opening ${remotePath} in Zed…` });
+  } catch (error) {
+    pushOutput({ kind: "error", text: `Could not open Zed: ${String(error)}` });
+  }
+  render();
+}
+
 async function openSSHKeyModal() {
   try {
     state.sshKeys = await backend("ListSSHKeys", state.selectedId);
@@ -684,6 +704,10 @@ function mountTerminal() {
         brightWhite: "#151b2a",
       },
     });
+    terminal.parser.registerOscHandler(7, (data) => {
+      recordRemoteDirectory(data);
+      return true;
+    });
     fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(terminalHost);
@@ -754,6 +778,21 @@ function connectionLabel() {
   if (state.connection === "connecting") return "Connecting";
   if (state.connection === "error") return "Connection issue";
   return "Ready";
+}
+
+function currentRemotePath() {
+  return state.remotePaths[state.selectedId] || "~";
+}
+
+function recordRemoteDirectory(value: string) {
+  try {
+    const location = new URL(value);
+    if (location.protocol !== "file:") return;
+    const path = decodeURIComponent(location.pathname);
+    if (path) state.remotePaths[state.selectedId] = path;
+  } catch {
+    // Ignore malformed or non-standard shell integration messages.
+  }
 }
 
 function initials(name: string) {

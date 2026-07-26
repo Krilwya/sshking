@@ -19,6 +19,14 @@ func OpenZed(server config.Server, remotePath string, newWindow bool, password s
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(server.Identity) != "" {
+		alias, err := ensureZedSSHConfig(server)
+		if err != nil {
+			return err
+		}
+		server.Host = alias
+		server.Port = 0
+	}
 
 	args := make([]string, 0, 2)
 	if newWindow {
@@ -51,10 +59,14 @@ func zedSSHURL(server config.Server, remotePath, password string) string {
 	if password != "" {
 		user = url.UserPassword(server.User, password)
 	}
+	host := server.Host
+	if server.Port > 0 {
+		host = net.JoinHostPort(server.Host, fmt.Sprintf("%d", server.Port))
+	}
 	return (&url.URL{
 		Scheme: "ssh",
 		User:   user,
-		Host:   net.JoinHostPort(server.Host, fmt.Sprintf("%d", server.Port)),
+		Host:   host,
 		Path:   path,
 	}).String()
 }
