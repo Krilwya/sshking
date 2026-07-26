@@ -390,6 +390,7 @@ button:disabled { opacity: .4; pointer-events: none; }
 .modal-actions .primary { border: 1px solid rgba(219,221,255,.3); color: #171827; background: linear-gradient(145deg, #e4e5ff, #a7aaf6); font-size: 11px; font-weight: 650; }
 .modal-actions .danger { display: flex; align-items: center; gap: 7px; border: 1px solid rgba(165,29,61,.2); color: #961c3a; background: rgba(255,86,115,.09); }
 .modal-actions .danger svg { width: 14px; }
+.host-key-fingerprint { margin: 4px 0 4px; padding: 13px 14px; overflow-wrap: anywhere; border: 1px solid rgba(169,172,255,.22); border-radius: 11px; color: #d8daff; background: rgba(4,7,17,.28); font: 500 11px "Cascadia Mono", "SFMono-Regular", Consolas, monospace; }
 
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: 240px minmax(0, 1fr); }

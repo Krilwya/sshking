@@ -134,7 +134,7 @@ func (a *App) SavePreferences(preferences config.Preferences) (config.Config, er
 	return a.cfg, a.store.Save(a.cfg)
 }
 
-func (a *App) Connect(id, password string, rememberPassword, requireBiometric bool) error {
+func (a *App) Connect(id, password string, rememberPassword, requireBiometric, trustNewHost bool) error {
 	a.mu.Lock()
 	if a.session != nil {
 		_ = a.session.Close()
@@ -167,9 +167,12 @@ func (a *App) Connect(id, password string, rememberPassword, requireBiometric bo
 	}
 
 	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "connecting", "serverId": id})
-	session, err := sshclient.Connect(server, password)
+	session, err := sshclient.Connect(server, password, trustNewHost)
 	if err != nil {
-		wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "error", "message": err.Error()})
+		var hostKeyErr *sshclient.HostKeyVerificationError
+		if !errors.As(err, &hostKeyErr) {
+			wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "error", "message": err.Error()})
+		}
 		return err
 	}
 
@@ -189,6 +192,9 @@ func (a *App) Connect(id, password string, rememberPassword, requireBiometric bo
 	a.mu.Lock()
 	for i := range a.cfg.Servers {
 		if a.cfg.Servers[i].ID == id {
+			if a.cfg.Servers[i].Fingerprint == "" && session.HostKeyFingerprint() != "" {
+				a.cfg.Servers[i].Fingerprint = session.HostKeyFingerprint()
+			}
 			a.cfg.Servers[i].PasswordSaved = rememberPassword && password != ""
 			a.cfg.Servers[i].RequireBiometric = a.cfg.Servers[i].PasswordSaved && requireBiometric
 			break

@@ -41,7 +41,10 @@ func main() {
 			WebviewIsTransparent: true,
 			WindowIsTranslucent:  true,
 			TitleBar:             mac.TitleBarHiddenInset(),
-			Appearance:           mac.NSAppearanceNameDarkAqua,
+			// The frontend uses dark navy text on a light glass surface. Keep the
+			// native visual-effect backdrop in the matching Aqua appearance;
+			// forcing DarkAqua makes the same text nearly invisible on macOS.
+			Appearance: mac.NSAppearanceNameAqua,
 		},
 	})
 	if err != nil {

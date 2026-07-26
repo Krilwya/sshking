@@ -3,8 +3,8 @@ module sshking
 go 1.25.0
 
 require (
-	github.com/Microsoft/go-winio v0.6.1
-	github.com/wailsapp/wails/v2 v2.12.0
+	github.com/Microsoft/go-winio v0.6.2
+	github.com/wailsapp/wails/v2 v2.13.0
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/crypto v0.54.0
 )
@@ -36,10 +36,7 @@ require (
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
-	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
 )

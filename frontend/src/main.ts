@@ -34,6 +34,11 @@ type PublicKeyInfo = {
   fingerprint: string;
 };
 type ConnectionState = "idle" | "connecting" | "connected" | "error";
+type ConnectionRequest = {
+  password: string;
+  rememberPassword: boolean;
+  requireBiometric: boolean;
+};
 
 declare global {
   interface Window {
@@ -86,11 +91,13 @@ const state = {
     { kind: "system", text: "SSHKing secure terminal · session ready" },
     { kind: "muted", text: "Select a server and connect when you’re ready." },
   ],
-  modal: "" as "" | "server" | "settings" | "connect" | "zed" | "ssh-key",
+  modal: "" as "" | "server" | "settings" | "connect" | "zed" | "ssh-key" | "trust-host-key",
   editingId: "",
   sshKeys: [] as PublicKeyInfo[],
   biometricAvailable: false,
   biometricName: "Device authentication",
+  pendingConnection: null as ConnectionRequest | null,
+  pendingHostFingerprint: "",
 };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -132,6 +139,8 @@ async function mockBackend(name: string, args: unknown[]) {
   }
   if (name === "Connect") {
     await new Promise((resolve) => setTimeout(resolve, 650));
+    const selected = state.config.servers.find((server) => server.id === args[0]);
+    if (selected && !selected.fingerprint) selected.fingerprint = "SHA256:demoHostFingerprint";
     return;
   }
   if (name === "ListSSHKeys") {
@@ -327,6 +336,16 @@ function modalMarkup() {
       <div class="modal-actions"><span></span><div><button type="button" class="ghost modal-close">Cancel</button><button class="primary">Open secure session</button></div></div>
     </form></div>`;
   }
+  if (state.modal === "trust-host-key") {
+    const selected = state.config.servers.find((server) => server.id === state.selectedId);
+    return `<div class="modal-backdrop"><section class="modal glass-modal connect-modal" id="trust-host-key-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">First connection</span><h2>Trust ${escapeHtml(selected?.name ?? "this server")}?</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">This server presented a host key that SSHKing has not seen before. Verify the fingerprint with your administrator before trusting it. SSHKing will pin it to this server after connecting.</p>
+      <div class="host-key-fingerprint">${escapeHtml(state.pendingHostFingerprint)}</div>
+      <div class="modal-actions"><span></span><div><button type="button" class="ghost modal-close">Cancel</button><button type="button" class="primary" id="trust-host-key">Trust and connect</button></div></div>
+    </section></div>`;
+  }
   if (state.modal === "settings") {
     const p = state.config.preferences;
     return `<div class="modal-backdrop"><form class="modal glass-modal" id="settings-form">
@@ -355,8 +374,8 @@ function modalMarkup() {
       ${field("User", "user", existing?.user ?? p.defaultUser)}
       ${field("Port", "port", String(existing?.port ?? p.defaultPort), "number")}
       ${field("Remote shell", "shell", existing?.shell ?? p.defaultShell, "text", "default, zsh, bash, fish")}
-      ${field("Private key", "identity", existing?.identity ?? p.defaultIdentity ?? "", "text", "~/.ssh/id_ed25519")}
-      <div class="full">${field("Pinned fingerprint", "fingerprint", existing?.fingerprint ?? "", "text", "SHA256:…")}</div>
+      ${field("Private key (optional)", "identity", existing?.identity ?? p.defaultIdentity ?? "", "text", "~/.ssh/id_ed25519", false)}
+      <div class="full">${field("Pinned fingerprint (optional)", "fingerprint", existing?.fingerprint ?? "", "text", "SHA256:…", false)}</div>
     </div>
     <div class="modal-actions">
       ${existing ? `<button type="button" class="danger" id="delete-server">${icons.trash} Delete</button>` : "<span></span>"}
@@ -365,8 +384,8 @@ function modalMarkup() {
   </form></div>`;
 }
 
-function field(label: string, name: string, value: string, type = "text", placeholder = "") {
-  return `<label class="form-field"><span>${label}</span><input name="${name}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" required></label>`;
+function field(label: string, name: string, value: string, type = "text", placeholder = "", required = true) {
+  return `<label class="form-field"><span>${label}</span><input name="${name}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}"${required ? " required" : ""}></label>`;
 }
 
 function bindEvents() {
@@ -401,6 +420,7 @@ function bindEvents() {
   document.querySelector<HTMLFormElement>("#server-form")?.addEventListener("submit", saveServer);
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", saveSettings);
   document.querySelector<HTMLFormElement>("#connect-form")?.addEventListener("submit", connectWithCredentials);
+  document.querySelector("#trust-host-key")?.addEventListener("click", trustHostKey);
   document.querySelector<HTMLFormElement>("#zed-form")?.addEventListener("submit", openInZed);
   document.querySelector<HTMLFormElement>("#ssh-key-form")?.addEventListener("submit", installSSHKey);
   const rememberPassword = document.querySelector<HTMLInputElement>('input[name="rememberPassword"]');
@@ -421,6 +441,10 @@ function openModal(type: "server" | "settings") {
 }
 
 function closeModal() {
+  if (state.modal === "trust-host-key") {
+    state.pendingConnection = null;
+    state.pendingHostFingerprint = "";
+  }
   state.modal = "";
   state.editingId = "";
   render();
@@ -485,17 +509,35 @@ async function toggleConnection() {
 async function connectWithCredentials(event: SubmitEvent) {
   event.preventDefault();
   const form = new FormData(event.currentTarget as HTMLFormElement);
-  const password = String(form.get("password") ?? "");
-  const rememberPassword = form.get("rememberPassword") === "on";
-  const requireBiometric = form.get("requireBiometric") === "on";
+  await attemptConnection({
+    password: String(form.get("password") ?? ""),
+    rememberPassword: form.get("rememberPassword") === "on",
+    requireBiometric: form.get("requireBiometric") === "on",
+  }, false);
+}
+
+async function trustHostKey() {
+  const request = state.pendingConnection;
+  if (!request) {
+    closeModal();
+    return;
+  }
+  state.pendingConnection = null;
+  state.pendingHostFingerprint = "";
+  await attemptConnection(request, true);
+}
+
+async function attemptConnection(request: ConnectionRequest, trustNewHost: boolean) {
   state.modal = "";
   state.connection = "connecting";
   pushOutput({ kind: "system", text: `Opening secure session…` });
   render();
   try {
-    await backend("Connect", state.selectedId, password, rememberPassword, requireBiometric);
+    await backend("Connect", state.selectedId, request.password, request.rememberPassword, request.requireBiometric, trustNewHost);
     const refreshed = await backend("GetState");
     if (refreshed?.config) state.config = refreshed.config;
+    state.pendingConnection = null;
+    state.pendingHostFingerprint = "";
     state.connection = "connected";
     pushOutput({ kind: "success", text: "Connected · remote shell is ready" });
     fitTerminal();
@@ -505,8 +547,20 @@ async function connectWithCredentials(event: SubmitEvent) {
       pushOutput({ kind: "output", text: "Welcome to Northstar Linux 24.04 LTS" });
     }
   } catch (error) {
+    const message = String(error);
+    const fingerprint = message.includes("host key verification required")
+      ? message.match(/SHA256:[A-Za-z0-9+/=]+/)?.[0]
+      : undefined;
+    if (fingerprint && !trustNewHost) {
+      state.connection = "idle";
+      state.pendingConnection = request;
+      state.pendingHostFingerprint = fingerprint;
+      state.modal = "trust-host-key";
+      render();
+      return;
+    }
     state.connection = "error";
-    pushOutput({ kind: "error", text: String(error) });
+    pushOutput({ kind: "error", text: message });
   }
   render();
   if (state.connection === "connected") {

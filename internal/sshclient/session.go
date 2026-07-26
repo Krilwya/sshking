@@ -14,22 +14,34 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"sshking/internal/config"
 )
 
 type Session struct {
-	client  *ssh.Client
-	session *ssh.Session
-	stdin   io.WriteCloser
-	output  chan string
-	done    chan error
-	once    sync.Once
-	writeMu sync.Mutex
+	client             *ssh.Client
+	session            *ssh.Session
+	stdin              io.WriteCloser
+	output             chan string
+	done               chan error
+	hostKeyFingerprint string
+	once               sync.Once
+	writeMu            sync.Mutex
 }
 
-func Connect(server config.Server, password string) (*Session, error) {
-	client, err := dial(server, password)
+// HostKeyVerificationError indicates that a server presented an unknown host
+// key and the user must explicitly trust it before the connection can proceed.
+type HostKeyVerificationError struct {
+	Fingerprint string
+}
+
+func (e *HostKeyVerificationError) Error() string {
+	return fmt.Sprintf("host key verification required: %s", e.Fingerprint)
+}
+
+func Connect(server config.Server, password string, trustNewHost bool) (*Session, error) {
+	client, fingerprint, err := dialWithHostKeyPolicy(server, password, trustNewHost)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +80,7 @@ func Connect(server config.Server, password string) (*Session, error) {
 	s := &Session{
 		client: client, session: ss, stdin: stdin,
 		output: make(chan string, 64), done: make(chan error, 1),
+		hostKeyFingerprint: fingerprint,
 	}
 	command := shellCommand(server.Shell)
 	if command == "" {
@@ -89,19 +102,56 @@ func Connect(server config.Server, password string) (*Session, error) {
 }
 
 func dial(server config.Server, password string) (*ssh.Client, error) {
+	client, _, err := dialWithHostKeyPolicy(server, password, false)
+	return client, err
+}
+
+func dialWithHostKeyPolicy(server config.Server, password string, trustNewHost bool) (*ssh.Client, string, error) {
 	auth, err := authMethods(server.Identity, password)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(auth) == 0 {
-		return nil, errors.New("no SSH authentication method available; configure a private key, password, or SSH agent")
+		return nil, "", errors.New("no SSH authentication method available; configure a private key, password, or SSH agent")
 	}
-	hostKey := ssh.InsecureIgnoreHostKey()
+	var actualFingerprint string
+	var hostKey ssh.HostKeyCallback
 	if expected := strings.TrimSpace(server.Fingerprint); expected != "" {
 		hostKey = func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			actual := ssh.FingerprintSHA256(key)
 			if actual != expected {
 				return fmt.Errorf("host key mismatch: got %s", actual)
+			}
+			actualFingerprint = actual
+			return nil
+		}
+	} else {
+		knownHosts, knownHostsErr := knownHostsCallback()
+		hostKey = func(host string, remote net.Addr, key ssh.PublicKey) error {
+			actualFingerprint = ssh.FingerprintSHA256(key)
+			if knownHosts != nil {
+				if err := knownHosts(host, remote, key); err == nil {
+					return nil
+				} else {
+					var keyErr *knownhosts.KeyError
+					if !errors.As(err, &keyErr) {
+						return err
+					}
+					if len(keyErr.Want) > 0 || !trustNewHost {
+						if len(keyErr.Want) == 0 && !trustNewHost {
+							return &HostKeyVerificationError{Fingerprint: actualFingerprint}
+						}
+						return err
+					}
+					return nil
+				}
+			}
+			if knownHostsErr != nil && !errors.Is(knownHostsErr, os.ErrNotExist) {
+				// A malformed known_hosts file should not be silently bypassed.
+				return knownHostsErr
+			}
+			if !trustNewHost {
+				return &HostKeyVerificationError{Fingerprint: actualFingerprint}
 			}
 			return nil
 		}
@@ -113,8 +163,19 @@ func dial(server config.Server, password string) (*ssh.Client, error) {
 		Timeout:         10 * time.Second,
 	}
 	address := net.JoinHostPort(server.Host, fmt.Sprintf("%d", server.Port))
-	return ssh.Dial("tcp", address, sshCfg)
+	client, err := ssh.Dial("tcp", address, sshCfg)
+	return client, actualFingerprint, err
 }
+
+func knownHostsCallback() (ssh.HostKeyCallback, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory for known_hosts: %w", err)
+	}
+	return knownhosts.New(filepath.Join(home, ".ssh", "known_hosts"))
+}
+
+func (s *Session) HostKeyFingerprint() string { return s.hostKeyFingerprint }
 
 func (s *Session) Output() <-chan string { return s.output }
 func (s *Session) Done() <-chan error    { return s.done }
