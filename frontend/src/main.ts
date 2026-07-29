@@ -27,6 +27,7 @@ type Preferences = {
 };
 
 type Config = { servers: Server[]; preferences: Preferences };
+type Platform = "darwin" | "windows" | "linux";
 type PublicKeyInfo = {
   path: string;
   privatePath?: string;
@@ -84,6 +85,7 @@ const demoConfig: Config = {
 
 const state = {
   config: demoConfig,
+  platform: detectedPlatform(),
   selectedId: demoConfig.servers[0]?.id ?? "",
   query: "",
   connection: "idle" as ConnectionState,
@@ -120,9 +122,9 @@ async function mockBackend(name: string, args: unknown[]) {
     state.remotePaths["demo-1"] = "/srv/northstar";
     return {
       config: demoConfig,
-      platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "windows",
+      platform: detectedPlatform(),
       biometricAvailable: true,
-      biometricName: navigator.platform.toLowerCase().includes("mac") ? "Touch ID" : "Windows Hello",
+      biometricName: detectedPlatform() === "darwin" ? "Touch ID" : "Windows Hello",
     };
   }
   if (name === "SaveServer") {
@@ -163,7 +165,7 @@ function render() {
   const selected = state.config.servers.find((server) => server.id === state.selectedId);
   if (terminalHost?.isConnected) terminalHost.remove();
   app.innerHTML = `
-    <main class="window-shell">
+    <main class="window-shell platform-${state.platform}">
       <div class="ambient ambient-a"></div>
       <div class="ambient ambient-b"></div>
       <header class="titlebar">
@@ -175,11 +177,7 @@ function render() {
           <span class="status-dot ${state.connection}"></span>
           <span>${connectionLabel()}</span>
         </div>
-        <div class="window-controls">
-          <button data-window="min" aria-label="Minimise"><span></span></button>
-          <button data-window="max" aria-label="Maximise"><span class="max-icon"></span></button>
-          <button data-window="close" class="close" aria-label="Close"><span></span></button>
-        </div>
+        ${windowControlsMarkup()}
       </header>
 
       <section class="workspace">
@@ -194,13 +192,13 @@ function render() {
           <label class="searchbox">
             ${icons.search}
             <input id="server-search" value="${escapeHtml(state.query)}" placeholder="Search servers" autocomplete="off" />
-            <kbd>⌘ K</kbd>
+            <kbd>${state.platform === "darwin" ? "⌘ K" : "Ctrl K"}</kbd>
           </label>
           <nav class="server-list">${serverList()}</nav>
           <div class="sidebar-footer">
             <button class="footer-button" id="open-settings">
               <span class="footer-icon">${icons.settings}</span>
-              <span><strong>Preferences</strong><small>${state.config.preferences.logActivity ? "Activity logging on" : "Private mode"}</small></span>
+              <span><strong>${state.platform === "darwin" ? "Preferences" : "Settings"}</strong><small>${state.config.preferences.logActivity ? "Activity logging on" : "Private mode"}</small></span>
               ${icons.chevron}
             </button>
           </div>
@@ -245,6 +243,15 @@ function render() {
     </main>`;
   bindEvents();
   mountTerminal();
+}
+
+function windowControlsMarkup() {
+  if (state.platform !== "windows") return "";
+  return `<div class="window-controls" aria-label="Window controls">
+    <button data-window="min" aria-label="Minimise" title="Minimise"><span></span></button>
+    <button data-window="max" aria-label="Maximise" title="Maximise"><span class="max-icon"></span></button>
+    <button data-window="close" class="close" aria-label="Close" title="Close"><span></span></button>
+  </div>`;
 }
 
 function serverList() {
@@ -803,6 +810,17 @@ function keyName(name: string) {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "server";
 }
 
+function detectedPlatform(): Platform {
+  const platform = navigator.platform.toLowerCase();
+  if (platform.includes("mac")) return "darwin";
+  if (platform.includes("win")) return "windows";
+  return "linux";
+}
+
+function normalisePlatform(value: unknown): Platform {
+  return value === "darwin" || value === "windows" || value === "linux" ? value : detectedPlatform();
+}
+
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]!);
 }
@@ -811,6 +829,7 @@ async function initialise() {
   try {
     const initial = await backend("GetState");
     if (initial?.config) state.config = initial.config;
+    state.platform = normalisePlatform(initial?.platform);
     state.biometricAvailable = Boolean(initial?.biometricAvailable);
     state.biometricName = String(initial?.biometricName || "Device authentication");
     state.selectedId = state.config.servers[0]?.id ?? "";
@@ -823,6 +842,11 @@ async function initialise() {
 
 window.addEventListener("keydown", (event) => {
   const terminalHasFocus = state.connection === "connected" && terminal?.textarea === document.activeElement;
+  if (state.platform === "darwin" && event.metaKey && (event.code === "Comma" || event.key === ",")) {
+    event.preventDefault();
+    openModal("settings");
+    return;
+  }
   if (!terminalHasFocus && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     document.querySelector<HTMLInputElement>("#server-search")?.focus();
