@@ -12,7 +12,9 @@ system webview.
 - SSH agent and private-key authentication
 - Bounded terminal scrollback
 - Optional activity and command logs streamed to disk
-- Frameless window with integrated minimize, maximize, and close controls
+- Native Cocoa window chrome on macOS, including traffic lights and rounded corners
+- Integrated Windows controls with DWM shadow and Windows 11 rounded corners
+- Platform conventions such as macOS Preferences, Command shortcuts, and native About
 
 ## Development
 

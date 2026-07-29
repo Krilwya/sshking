@@ -51,6 +51,17 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   backdrop-filter: blur(48px) saturate(1.35);
 }
 
+.platform-darwin {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.platform-windows {
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+}
+
 .window-shell::before {
   content: "";
   position: absolute;
@@ -75,6 +86,13 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   padding: 0 15px 0 20px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   --wails-draggable: drag;
+}
+.platform-darwin .titlebar {
+  height: 58px;
+  padding: 0 20px 0 86px;
+}
+.platform-windows .titlebar {
+  padding-right: 0;
 }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 720; letter-spacing: -.01em; }
 .brand-mark {
@@ -108,19 +126,26 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .status-dot.error { background: var(--red); }
 @keyframes pulse { 50% { opacity: .35; transform: scale(.75); } }
 
-.window-controls { justify-self: end; display: flex; align-items: center; gap: 4px; --wails-draggable: no-drag; }
+.window-controls {
+  height: 100%;
+  justify-self: end;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  --wails-draggable: no-drag;
+}
 .window-controls button {
-  width: 38px;
-  height: 30px;
+  width: 46px;
+  height: 100%;
   display: grid;
   place-items: center;
   border: 0;
-  border-radius: 9px;
+  border-radius: 0;
   background: transparent;
   color: rgba(22,29,46,.65);
 }
-.window-controls button:hover { background: rgba(255,255,255,.08); color: white; }
-.window-controls button.close:hover { background: rgba(255,83,112,.72); }
+.window-controls button:hover { background: rgba(20,25,38,.08); color: var(--ink); }
+.window-controls button.close:hover { background: #c42b1c; color: white; }
 .window-controls button span { display: block; width: 10px; height: 1px; background: currentColor; }
 .window-controls .max-icon { height: 9px; border: 1px solid currentColor; background: transparent; border-radius: 2px; }
 .window-controls .close span { position: relative; width: 11px; background: transparent; }
