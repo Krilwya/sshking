@@ -177,6 +177,10 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: rgba(215,220,243,.35); box-shadow: 0 0 0 3px rgba(255,255,255,.025); }
 .server-indicators { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .server-missing { display: grid; place-items: center; width: 15px; height: 15px; flex: 0 0 auto; border: 1px solid rgba(180,104,26,.22); border-radius: 50%; color: #8a4c0d; background: rgba(255,188,94,.2); font-size: 9px; font-weight: 850; }
+.server-missing:hover { border-color: rgba(180,104,26,.42); background: rgba(255,188,94,.36); transform: scale(1.08); }
+.server-setup-modal .setup-options { display: grid; gap: 8px; }
+.server-setup-modal .history-button { width: 100%; }
+.server-setup-modal .history-button > svg { width: 16px; height: 16px; }
 .status-dot.connected, .server-state.online { background: var(--green); box-shadow: 0 0 10px rgba(119,229,189,.55); }
 .status-dot.connecting { background: #ffc56e; animation: pulse 1.2s infinite; }
 .status-dot.error { background: var(--red); }

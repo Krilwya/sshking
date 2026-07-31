@@ -179,8 +179,9 @@ const state = {
   query: "",
   tabs: [] as TerminalTab[],
   activeTabId: "",
+  activeTabByServer: {} as Record<string, string>,
   splitTabId: "",
-  modal: "" as "" | "server" | "team" | "account" | "settings" | "activity" | "connect" | "zed" | "ssh-key" | "files" | "tunnels" | "palette" | "trust-host-key",
+  modal: "" as "" | "server" | "server-setup" | "team" | "account" | "settings" | "activity" | "connect" | "zed" | "ssh-key" | "files" | "tunnels" | "palette" | "trust-host-key",
   editingId: "",
   editingTeamId: "",
   pendingServerTeamId: "",
@@ -333,6 +334,7 @@ function restoreWorkspace() {
       activeIndex?: number;
       splitIndex?: number;
       sessionOpen?: boolean[];
+      activeTabIds?: Record<string, string>;
     };
     const knownServers = new Set(state.config.servers.map((server) => server.id));
     const serverIds = (saved.serverIds ?? []).filter((id) => knownServers.has(id)).slice(0, 12);
@@ -345,18 +347,22 @@ function restoreWorkspace() {
         tab.title = state.config.servers.find((server) => server.id === tab.serverId)?.name ?? "Terminal";
       }
     });
+    state.activeTabByServer = { ...(saved.activeTabIds ?? {}) };
+    for (const tab of state.tabs) if (!state.activeTabByServer[tab.serverId]) state.activeTabByServer[tab.serverId] = tab.id;
     const activeIndex = Math.min(Math.max(saved.activeIndex ?? 0, 0), state.tabs.length - 1);
     state.tabs.forEach((tab, index) => {
       tab.restoreSession = saved.sessionOpen?.[index] ?? index === activeIndex;
     });
     state.activeTabId = state.tabs[activeIndex]?.id ?? "";
     state.selectedId = state.tabs[activeIndex]?.serverId ?? state.selectedId;
+    if (state.selectedId && state.activeTabId) state.activeTabByServer[state.selectedId] = state.activeTabId;
     if (typeof saved.splitIndex === "number" && saved.splitIndex >= 0 && saved.splitIndex < state.tabs.length && saved.splitIndex !== activeIndex) {
       state.splitTabId = state.tabs[saved.splitIndex].id;
     }
   } catch {
     state.tabs = [newTerminalTab(state.selectedId)];
     state.activeTabId = state.tabs[0].id;
+    if (state.selectedId) state.activeTabByServer[state.selectedId] = state.activeTabId;
   }
 }
 
@@ -370,6 +376,7 @@ function persistWorkspace() {
       activeIndex: Math.max(0, state.tabs.findIndex((tab) => tab.id === state.activeTabId)),
       splitIndex: state.tabs.findIndex((tab) => tab.id === state.splitTabId),
       sessionOpen: state.tabs.map((tab) => tab.restoreSession || tab.connection === "connected" || tab.connection === "connecting"),
+      activeTabIds: state.activeTabByServer,
     }));
   } catch {
     // Workspace persistence is a convenience; private WebViews may disable storage.
@@ -406,12 +413,32 @@ function persistSidebarState() {
 }
 
 function activeTab() {
-  return state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0];
+  const scoped = tabsForServer();
+  return scoped.find((tab) => tab.id === state.activeTabId) ?? scoped[0];
+}
+
+function tabsForServer(serverId = state.selectedId) {
+  return state.tabs.filter((tab) => tab.serverId === serverId);
+}
+
+function activateServer(serverId: string, createIfMissing = true) {
+  state.selectedId = serverId;
+  let scoped = tabsForServer(serverId);
+  let tab = scoped.find((item) => item.id === state.activeTabByServer[serverId]) ?? scoped[0];
+  if (!tab && createIfMissing && serverId) {
+    tab = newTerminalTab(serverId);
+    state.tabs.push(tab);
+    scoped = [tab];
+    scheduleCloudSync();
+  }
+  state.activeTabId = tab?.id ?? "";
+  if (tab) state.activeTabByServer[serverId] = tab.id;
+  if (!scoped.some((item) => item.id === state.splitTabId)) state.splitTabId = "";
 }
 
 function visibleTabs() {
   const active = activeTab();
-  const split = state.tabs.find((tab) => tab.id === state.splitTabId);
+  const split = tabsForServer().find((tab) => tab.id === state.splitTabId);
   return [active, split && split.id !== active?.id ? split : undefined].filter(Boolean) as TerminalTab[];
 }
 
@@ -420,6 +447,7 @@ function selectTab(tabId: string, focusTerminal = true) {
   if (!tab) return;
   state.activeTabId = tab.id;
   state.selectedId = tab.serverId;
+  state.activeTabByServer[tab.serverId] = tab.id;
   render();
   requestAnimationFrame(() => {
     if (focusTerminal) tab.terminal?.focus();
@@ -432,6 +460,7 @@ function addTerminalTab(serverId = state.selectedId) {
   state.tabs.push(tab);
   state.activeTabId = tab.id;
   state.selectedId = tab.serverId;
+  state.activeTabByServer[tab.serverId] = tab.id;
   render();
   scheduleCloudSync();
   requestAnimationFrame(() => {
@@ -455,11 +484,17 @@ async function closeTerminalTab(tabId: string) {
   state.tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId !== tab.id);
   tab.terminal?.dispose();
   if (state.splitTabId === tab.id) state.splitTabId = "";
-  if (!state.tabs.length) state.tabs.push(newTerminalTab());
+  const serverId = tab.serverId;
+  let scoped = tabsForServer(serverId);
+  if (!scoped.length && serverId === state.selectedId) {
+    const replacement = newTerminalTab(serverId);
+    state.tabs.push(replacement);
+    scoped = [replacement];
+  }
   if (state.activeTabId === tab.id) {
-    const next = state.tabs[Math.min(index, state.tabs.length - 1)];
-    state.activeTabId = next.id;
-    state.selectedId = next.serverId;
+    const next = scoped[Math.min(index, scoped.length - 1)] ?? scoped[0];
+    state.activeTabId = next?.id ?? "";
+    if (next) state.activeTabByServer[serverId] = next.id;
   }
   render();
   scheduleCloudSync({ tab: tabId });
@@ -470,7 +505,7 @@ function toggleSplitPane() {
   if (state.splitTabId) {
     state.splitTabId = "";
   } else {
-    let split = state.tabs.find((tab) => tab.id !== state.activeTabId);
+    let split = tabsForServer().find((tab) => tab.id !== state.activeTabId);
     if (!split) {
       split = newTerminalTab(state.selectedId);
       state.tabs.push(split);
@@ -569,7 +604,7 @@ function render() {
           </div>
 
           <div class="tabbar">
-            <div class="terminal-tabs">${state.tabs.map((tab) => `<button class="terminal-tab ${tab.id === state.activeTabId ? "active" : ""}" data-tab="${tab.id}" title="${escapeHtml(tab.manualTitle ? "Custom name · click to rename" : "Last command · click to set a permanent name")}"><span class="status-dot ${tab.connection}"></span><span class="tab-title" data-tab-title="${tab.id}">${escapeHtml(tab.title)}</span><i class="tab-close" data-close-tab="${tab.id}" aria-label="Close terminal">×</i></button>`).join("")}</div>
+            <div class="terminal-tabs">${tabsForServer().map((tab) => `<button class="terminal-tab ${tab.id === state.activeTabId ? "active" : ""}" data-tab="${tab.id}" title="${escapeHtml(tab.manualTitle ? "Custom name · click to rename" : "Last command · click to set a permanent name")}"><span class="status-dot ${tab.connection}"></span><span class="tab-title" data-tab-title="${tab.id}">${escapeHtml(tab.title)}</span><i class="tab-close" data-close-tab="${tab.id}" aria-label="Close terminal">×</i></button>`).join("")}</div>
             <button class="new-tab" id="new-terminal-tab" aria-label="New terminal">${icons.plus}</button>
             <button class="split-button ${state.splitTabId ? "active" : ""}" id="toggle-split" aria-label="Toggle split terminal" title="Split terminal">▥</button>
             <span class="encryption"><i></i> end-to-end SSH</span>
@@ -662,13 +697,28 @@ function serverCard(server: Server) {
     <span class="server-avatar">${initials(server.name)}</span>
     <span class="server-copy"><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml(server.user)}@${escapeHtml(server.host)}</small></span>
     <span class="server-indicators">
-      ${state.readiness[server.id] && !state.readiness[server.id].ready ? `<span class="server-missing" title="${escapeHtml(state.readiness[server.id].message)}" aria-label="${escapeHtml(state.readiness[server.id].message)}">!</span>` : ""}
+      ${state.readiness[server.id] && !state.readiness[server.id].ready ? `<span class="server-missing" data-missing-server="${escapeHtml(server.id)}" title="${escapeHtml(state.readiness[server.id].message)} · click to configure" aria-label="Configure authentication for ${escapeHtml(server.name)}">!</span>` : ""}
       <span class="server-state ${online ? "online" : ""}"></span>
     </span>
   </button>`;
 }
 
 function modalMarkup() {
+  if (state.modal === "server-setup") {
+    const server = state.config.servers.find((item) => item.id === state.selectedId);
+    const readiness = server ? state.readiness[server.id] : undefined;
+    return `<div class="modal-backdrop"><section class="modal glass-modal connect-modal server-setup-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">This device</span><h2>Configure ${escapeHtml(server?.name ?? "server")}</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">${escapeHtml(readiness?.message ?? "This server needs a local authentication method.")} Cloud sync never copies passwords or private keys between devices.</p>
+      <div class="setup-options">
+        <button type="button" class="history-button" id="missing-use-password"><span class="footer-icon">●</span><span><strong>Use a password</strong><small>Connect now and optionally save it in this device’s secure vault</small></span>${icons.chevron}</button>
+        <button type="button" class="history-button" id="missing-use-key">${icons.key}<span><strong>Set up an SSH key</strong><small>Select an existing key or generate and install one</small></span>${icons.chevron}</button>
+        <button type="button" class="history-button" id="missing-edit-server">${icons.settings}<span><strong>Edit connection</strong><small>Choose a local identity path or update server options</small></span>${icons.chevron}</button>
+      </div>
+      <div class="modal-actions"><span></span><button type="button" class="ghost modal-close">Close</button></div>
+    </section></div>`;
+  }
   if (state.modal === "account") {
     return `<div class="modal-backdrop account-backdrop"><section class="modal glass-modal account-modal">
       <div class="modal-handle"></div>
@@ -941,19 +991,16 @@ function bindEvents() {
     if (action === "max") window.runtime?.WindowToggleMaximise();
     if (action === "close") window.runtime?.Quit();
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-server]").forEach((button) => button.onclick = () => {
-    state.selectedId = button.dataset.server ?? "";
-    const tab = activeTab();
-    if (tab && tab.connection === "idle") {
-      if (tab.serverId !== state.selectedId) {
-        void backend("ClearSessionTranscript", tab.id);
-        tab.restoredTranscript = "";
-      }
-      tab.serverId = state.selectedId;
-      if (!tab.manualTitle) tab.title = state.config.servers.find((server) => server.id === tab.serverId)?.name ?? "Terminal";
-      resetTerminal(tab);
-    }
+  document.querySelectorAll<HTMLButtonElement>("[data-server]").forEach((button) => button.onclick = (event) => {
+    const missing = (event.target as HTMLElement).closest<HTMLElement>("[data-missing-server]");
+    if (missing) { openMissingServerOptions(missing.dataset.missingServer ?? ""); return; }
+    activateServer(button.dataset.server ?? "");
     render();
+    requestAnimationFrame(() => {
+      const tab = activeTab();
+      tab?.terminal?.focus();
+      if (tab?.restoreSession && tab.connection === "idle") void autoConnectTab(tab, true);
+    });
   });
   document.querySelectorAll<HTMLElement>("[data-toggle-scope]").forEach((button) => button.addEventListener("click", () => {
     if (button.dataset.toggleScope === "personal") state.personalExpanded = !state.personalExpanded;
@@ -1029,6 +1076,9 @@ function bindEvents() {
   document.querySelectorAll<HTMLElement>("[data-cloud-login]").forEach((button) => button.addEventListener("click", () => void loginCloud(button.dataset.cloudLogin ?? "")));
   document.querySelector("#cloud-logout")?.addEventListener("click", () => void logoutCloud());
   document.querySelector("#account-settings")?.addEventListener("click", () => openModal("settings"));
+  document.querySelector("#missing-use-password")?.addEventListener("click", () => { state.modal = "connect"; render(); });
+  document.querySelector("#missing-use-key")?.addEventListener("click", () => void openSSHKeyModal());
+  document.querySelector("#missing-edit-server")?.addEventListener("click", () => { state.editingId = state.selectedId; openModal("server"); });
   const settingsForm = document.querySelector<HTMLFormElement>("#settings-form");
   settingsForm?.addEventListener("input", () => previewSettings(settingsForm));
   settingsForm?.addEventListener("change", () => previewSettings(settingsForm));
@@ -1118,6 +1168,13 @@ function openAccount() {
   if (state.config.preferences.cloudUrl) void refreshCloudState();
 }
 
+function openMissingServerOptions(serverId: string) {
+  if (!serverId) return;
+  activateServer(serverId, true);
+  state.modal = "server-setup";
+  render();
+}
+
 function currentCloudURL() {
   return String(new FormData(document.querySelector<HTMLFormElement>("#settings-form") ?? document.createElement("form")).get("cloudUrl") ?? state.config.preferences.cloudUrl ?? "").trim().replace(/\/$/, "");
 }
@@ -1158,11 +1215,16 @@ async function logoutCloud() {
 }
 
 function cloudTabsPayload(): CloudTab[] {
-  return state.tabs.filter((tab) => Boolean(tab.serverId)).map((tab, position) => ({
-    id: tab.id, serverId: tab.serverId, title: tab.title, manualTitle: tab.manualTitle,
-    restore: tab.restoreSession || tab.connection === "connected" || tab.connection === "connecting",
-    lastPath: tab.remotePath, position,
-  }));
+  const positions: Record<string, number> = {};
+  return state.tabs.filter((tab) => Boolean(tab.serverId)).map((tab) => {
+    const position = positions[tab.serverId] ?? 0;
+    positions[tab.serverId] = position + 1;
+    return {
+      id: tab.id, serverId: tab.serverId, title: tab.title, manualTitle: tab.manualTitle,
+      restore: tab.restoreSession || tab.connection === "connected" || tab.connection === "connecting",
+      lastPath: tab.remotePath, position,
+    };
+  });
 }
 
 function scheduleCloudSync(options: { tab?: string; server?: string; team?: string } = {}) {
@@ -1210,11 +1272,10 @@ async function syncCloudWorkspace(initialPull = false) {
       tab.manualTitle = Boolean(remote.manualTitle);
       tab.remotePath = remote.lastPath || tab.remotePath;
       tab.restoreSession = Boolean(remote.restore) || Boolean(state.config.servers.find((server) => server.id === remote.serverId)?.useTmux);
+      if (!state.activeTabByServer[remote.serverId]) state.activeTabByServer[remote.serverId] = tab.id;
     }
-    if (!state.tabs.length) state.tabs.push(newTerminalTab(state.config.servers[0]?.id ?? ""));
-    if (!state.tabs.some((tab) => tab.id === state.activeTabId)) state.activeTabId = state.tabs[0].id;
-    const active = activeTab(); if (active) state.selectedId = active.serverId;
-    if (!state.tabs.some((tab) => tab.id === state.splitTabId)) state.splitTabId = "";
+    if (!state.config.servers.some((server) => server.id === state.selectedId)) state.selectedId = state.config.servers[0]?.id ?? "";
+    activateServer(state.selectedId, true);
     cloudHydrated = true;
     persistWorkspace();
     render();
@@ -1396,15 +1457,7 @@ async function saveServer(event: SubmitEvent) {
   }
   persistSidebarState();
   state.selectedId = server.id || state.config.servers.at(-1)?.id || "";
-  const tab = activeTab();
-  if (tab && tab.connection === "idle") {
-    if (tab.serverId !== state.selectedId) {
-      void backend("ClearSessionTranscript", tab.id);
-      tab.restoredTranscript = "";
-    }
-    tab.serverId = state.selectedId;
-    if (!tab.manualTitle) tab.title = state.config.servers.find((item) => item.id === tab.serverId)?.name ?? "Terminal";
-  }
+  activateServer(state.selectedId, true);
   closeModal();
   state.readiness = await backend("GetServerReadiness");
   scheduleCloudSync();
@@ -1525,12 +1578,9 @@ async function deleteServer() {
     tab.terminal?.dispose();
   }
   state.tabs = state.tabs.filter((item) => item.serverId !== deletedId);
+  delete state.activeTabByServer[deletedId];
   state.selectedId = state.config.servers[0]?.id ?? "";
-  if (!state.tabs.length) state.tabs.push(newTerminalTab(state.selectedId));
-  const next = state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0];
-  state.activeTabId = next.id;
-  state.selectedId = next.serverId;
-  if (!state.tabs.some((tab) => tab.id === state.splitTabId)) state.splitTabId = "";
+  activateServer(state.selectedId, true);
   closeModal();
   deletedTabs.forEach((tab) => pendingCloudTabDeletes.add(tab.id));
   scheduleCloudSync({ server: deletedId });
@@ -2331,9 +2381,10 @@ window.addEventListener("keydown", (event) => {
   }
   if (!state.modal && event.ctrlKey && event.key === "Tab") {
     event.preventDefault();
-    const index = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
+    const scoped = tabsForServer();
+    const index = scoped.findIndex((tab) => tab.id === state.activeTabId);
     const direction = event.shiftKey ? -1 : 1;
-    const next = state.tabs[(index + direction + state.tabs.length) % state.tabs.length];
+    const next = scoped[(index + direction + scoped.length) % scoped.length];
     if (next) selectTab(next.id);
     return;
   }
