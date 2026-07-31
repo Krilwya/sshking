@@ -54,6 +54,10 @@ type CloudState = {
   providers: Record<"google" | "apple", boolean>;
   error?: string;
 };
+type ServerReadiness = { ready: boolean; hasKey: boolean; hasPassword: boolean; hasAgent: boolean; message: string };
+type CloudTab = { id: string; serverId: string; title: string; manualTitle?: boolean; restore?: boolean; lastPath?: string; position?: number };
+type CloudWorkspace = { revision: number; servers: unknown[]; teams: unknown[]; tabs: CloudTab[]; updatedAt: string };
+type CloudSyncResult = { config: Config; workspace: CloudWorkspace; readiness: Record<string, ServerReadiness> };
 type Platform = "darwin" | "windows" | "linux";
 type PublicKeyInfo = {
   path: string;
@@ -198,10 +202,18 @@ const state = {
   activity: [] as string[],
   cloud: { cloudUrl: "", signedIn: false, user: { id: "", displayName: "", email: "", avatarUrl: "" }, providers: { google: false, apple: false } } as CloudState,
   cloudLoading: false,
+  readiness: {} as Record<string, ServerReadiness>,
 };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 let copyToastTimer: number | undefined;
+let cloudSyncTimer: number | undefined;
+let cloudSyncInFlight = false;
+let cloudSyncQueued = false;
+let cloudHydrated = false;
+const pendingCloudTabDeletes = new Set<string>();
+const pendingCloudServerDeletes = new Set<string>();
+const pendingCloudTeamDeletes = new Set<string>();
 
 function backend(name: string, ...args: unknown[]): Promise<any> {
   const fn = window.go?.main?.App?.[name];
@@ -209,7 +221,7 @@ function backend(name: string, ...args: unknown[]): Promise<any> {
   return mockBackend(name, args);
 }
 
-async function mockBackend(name: string, args: unknown[]) {
+async function mockBackend(name: string, args: unknown[]): Promise<any> {
   if (name === "GetState") {
     return {
       config: demoConfig,
@@ -251,6 +263,8 @@ async function mockBackend(name: string, args: unknown[]) {
   if (name === "GetCloudState") return { cloudUrl: args[0], signedIn: false, user: {}, providers: { google: false, apple: false } };
   if (name === "LoginCloud") return { cloudUrl: args[0], signedIn: true, user: { id: "demo", displayName: "Demo User", email: "demo@example.com", avatarUrl: "" }, providers: { google: true, apple: true } };
   if (name === "LogoutCloud") return;
+  if (name === "GetServerReadiness") return Object.fromEntries(state.config.servers.map((server) => [server.id, { ready: Boolean(server.identity || server.passwordSaved), hasKey: Boolean(server.identity), hasPassword: Boolean(server.passwordSaved), hasAgent: false, message: "Add a password or SSH key on this device" }]));
+  if (name === "SyncCloudWorkspace") return { config: state.config, workspace: { revision: 1, servers: state.config.servers, teams: state.config.teams, tabs: args[1] ?? [], updatedAt: new Date().toISOString() }, readiness: await mockBackend("GetServerReadiness", []) };
   if (name === "GetSessionTranscript") return "";
   if (name === "ClearSessionTranscript" || name === "ClearTerminalHistory") return;
   if (name === "Connect") {
@@ -419,6 +433,7 @@ function addTerminalTab(serverId = state.selectedId) {
   state.activeTabId = tab.id;
   state.selectedId = tab.serverId;
   render();
+  scheduleCloudSync();
   requestAnimationFrame(() => {
     tab.terminal?.focus();
     void autoConnectTab(tab);
@@ -447,6 +462,7 @@ async function closeTerminalTab(tabId: string) {
     state.selectedId = next.serverId;
   }
   render();
+  scheduleCloudSync({ tab: tabId });
 }
 
 function toggleSplitPane() {
@@ -463,6 +479,7 @@ function toggleSplitPane() {
     state.splitTabId = split.id;
   }
   render();
+  if (created) scheduleCloudSync();
   if (created) requestAnimationFrame(() => void autoConnectTab(created));
 }
 
@@ -470,6 +487,7 @@ async function autoConnectTab(tab: TerminalTab, force = false) {
   if ((!force && !state.config.preferences.autoConnectTabs) || !tab.serverId || tab.connection !== "idle") return;
   const server = state.config.servers.find((item) => item.id === tab.serverId);
   if (!server) return;
+  if (state.readiness[server.id] && !state.readiness[server.id].ready) return;
   await attemptConnection({
     tabId: tab.id,
     password: "",
@@ -643,7 +661,10 @@ function serverCard(server: Server) {
   return `<button class="server-card ${active ? "active" : ""}" data-server="${escapeHtml(server.id)}">
     <span class="server-avatar">${initials(server.name)}</span>
     <span class="server-copy"><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml(server.user)}@${escapeHtml(server.host)}</small></span>
-    <span class="server-state ${online ? "online" : ""}"></span>
+    <span class="server-indicators">
+      ${state.readiness[server.id] && !state.readiness[server.id].ready ? `<span class="server-missing" title="${escapeHtml(state.readiness[server.id].message)}" aria-label="${escapeHtml(state.readiness[server.id].message)}">!</span>` : ""}
+      <span class="server-state ${online ? "online" : ""}"></span>
+    </span>
   </button>`;
 }
 
@@ -1109,7 +1130,10 @@ async function refreshCloudState() {
   }
   state.config.preferences.cloudUrl = cloudURL;
   state.cloudLoading = true; state.cloud.error = ""; render();
-  try { state.cloud = await backend("GetCloudState", cloudURL); }
+  try {
+    state.cloud = await backend("GetCloudState", cloudURL);
+    if (state.cloud.signedIn && !cloudHydrated) await syncCloudWorkspace(true);
+  }
   catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); }
   finally { state.cloudLoading = false; if (!state.modal || state.modal === "settings" || state.modal === "account") render(); }
 }
@@ -1117,15 +1141,93 @@ async function refreshCloudState() {
 async function loginCloud(provider: string) {
   const cloudURL = currentCloudURL(); if (!cloudURL || !provider) return;
   state.cloudLoading = true; state.cloud.error = ""; render();
-  try { state.cloud = await backend("LoginCloud", cloudURL, provider); state.config.preferences.cloudUrl = cloudURL; }
+  try {
+    state.cloud = await backend("LoginCloud", cloudURL, provider);
+    state.config.preferences.cloudUrl = cloudURL;
+    cloudHydrated = false;
+    await syncCloudWorkspace(true);
+  }
   catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); }
   finally { state.cloudLoading = false; if (!state.modal || state.modal === "settings" || state.modal === "account") render(); }
 }
 
 async function logoutCloud() {
   const cloudURL = currentCloudURL(); if (!cloudURL) return;
-  try { await backend("LogoutCloud", cloudURL); await refreshCloudState(); }
+  try { await backend("LogoutCloud", cloudURL); cloudHydrated = false; await refreshCloudState(); }
   catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); render(); }
+}
+
+function cloudTabsPayload(): CloudTab[] {
+  return state.tabs.filter((tab) => Boolean(tab.serverId)).map((tab, position) => ({
+    id: tab.id, serverId: tab.serverId, title: tab.title, manualTitle: tab.manualTitle,
+    restore: tab.restoreSession || tab.connection === "connected" || tab.connection === "connecting",
+    lastPath: tab.remotePath, position,
+  }));
+}
+
+function scheduleCloudSync(options: { tab?: string; server?: string; team?: string } = {}) {
+  if (options.tab) pendingCloudTabDeletes.add(options.tab);
+  if (options.server) pendingCloudServerDeletes.add(options.server);
+  if (options.team) pendingCloudTeamDeletes.add(options.team);
+  if (!state.cloud.signedIn) return;
+  window.clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = window.setTimeout(() => void syncCloudWorkspace(false), 700);
+}
+
+async function syncCloudWorkspace(initialPull = false) {
+  if (!state.cloud.signedIn || !state.config.preferences.cloudUrl) return;
+  if (cloudSyncInFlight) { cloudSyncQueued = true; return; }
+  cloudSyncInFlight = true;
+  const deletedTabs = Array.from(pendingCloudTabDeletes);
+  const deletedServers = Array.from(pendingCloudServerDeletes);
+  const deletedTeams = Array.from(pendingCloudTeamDeletes);
+  pendingCloudTabDeletes.clear(); pendingCloudServerDeletes.clear(); pendingCloudTeamDeletes.clear();
+  const submitted = initialPull ? [] : cloudTabsPayload();
+  const submittedIDs = new Set(submitted.map((tab) => tab.id));
+  try {
+    const result = await backend("SyncCloudWorkspace", state.config.preferences.cloudUrl, submitted, deletedTabs, deletedServers, deletedTeams) as CloudSyncResult;
+    state.config = result.config;
+    state.readiness = result.readiness ?? {};
+    const knownServers = new Set(state.config.servers.map((server) => server.id));
+    const cloudIDs = new Set(result.workspace.tabs.map((tab) => tab.id));
+    if (initialPull && result.workspace.tabs.length && !state.tabs.some((tab) => tab.connection === "connected" || tab.connection === "connecting")) {
+      state.tabs.forEach((tab) => tab.terminal?.dispose());
+      state.tabs = [];
+    } else {
+      for (const tab of [...state.tabs]) {
+        if (submittedIDs.has(tab.id) && !cloudIDs.has(tab.id)) {
+          tab.terminal?.dispose();
+          state.tabs.splice(state.tabs.indexOf(tab), 1);
+        }
+      }
+    }
+    for (const remote of result.workspace.tabs) {
+      if (!knownServers.has(remote.serverId)) continue;
+      let tab = state.tabs.find((item) => item.id === remote.id);
+      if (!tab) { tab = newTerminalTab(remote.serverId, remote.id); state.tabs.push(tab); }
+      tab.serverId = remote.serverId;
+      if (remote.manualTitle || !tab.manualTitle) tab.title = remote.title || state.config.servers.find((server) => server.id === remote.serverId)?.name || "Terminal";
+      tab.manualTitle = Boolean(remote.manualTitle);
+      tab.remotePath = remote.lastPath || tab.remotePath;
+      tab.restoreSession = Boolean(remote.restore) || Boolean(state.config.servers.find((server) => server.id === remote.serverId)?.useTmux);
+    }
+    if (!state.tabs.length) state.tabs.push(newTerminalTab(state.config.servers[0]?.id ?? ""));
+    if (!state.tabs.some((tab) => tab.id === state.activeTabId)) state.activeTabId = state.tabs[0].id;
+    const active = activeTab(); if (active) state.selectedId = active.serverId;
+    if (!state.tabs.some((tab) => tab.id === state.splitTabId)) state.splitTabId = "";
+    cloudHydrated = true;
+    persistWorkspace();
+    render();
+    if (initialPull && !result.workspace.tabs.length) scheduleCloudSync();
+  } catch (error) {
+    deletedTabs.forEach((id) => pendingCloudTabDeletes.add(id));
+    deletedServers.forEach((id) => pendingCloudServerDeletes.add(id));
+    deletedTeams.forEach((id) => pendingCloudTeamDeletes.add(id));
+    state.cloud.error = `Sync failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    cloudSyncInFlight = false;
+    if (cloudSyncQueued) { cloudSyncQueued = false; scheduleCloudSync(); }
+  }
 }
 
 function rangeControl(label: string, name: string, value: number, min: number, max: number, step: number, suffix: string) {
@@ -1249,6 +1351,7 @@ async function saveTeam(event: SubmitEvent) {
   state.teamsExpanded = true;
   persistSidebarState();
   closeModal();
+  scheduleCloudSync();
 }
 
 async function deleteTeam() {
@@ -1259,6 +1362,7 @@ async function deleteTeam() {
   state.personalExpanded = true;
   persistSidebarState();
   closeModal();
+  scheduleCloudSync({ team: deletedId });
 }
 
 async function saveServer(event: SubmitEvent) {
@@ -1302,6 +1406,8 @@ async function saveServer(event: SubmitEvent) {
     if (!tab.manualTitle) tab.title = state.config.servers.find((item) => item.id === tab.serverId)?.name ?? "Terminal";
   }
   closeModal();
+  state.readiness = await backend("GetServerReadiness");
+  scheduleCloudSync();
 }
 
 async function saveSettings(event: SubmitEvent) {
@@ -1412,7 +1518,8 @@ async function deleteServer() {
   if (!state.editingId) return;
   const deletedId = state.editingId;
   state.config = await backend("DeleteServer", deletedId);
-  for (const tab of state.tabs.filter((item) => item.serverId === deletedId)) {
+  const deletedTabs = state.tabs.filter((item) => item.serverId === deletedId);
+  for (const tab of deletedTabs) {
     await backend("ClearSessionTranscript", tab.id).catch(() => undefined);
     window.clearTimeout(tab.reconnectTimer);
     tab.terminal?.dispose();
@@ -1425,6 +1532,8 @@ async function deleteServer() {
   state.selectedId = next.serverId;
   if (!state.tabs.some((tab) => tab.id === state.splitTabId)) state.splitTabId = "";
   closeModal();
+  deletedTabs.forEach((tab) => pendingCloudTabDeletes.add(tab.id));
+  scheduleCloudSync({ server: deletedId });
 }
 
 async function toggleConnection() {
@@ -1440,6 +1549,7 @@ async function toggleConnection() {
     state.tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId !== tab.id);
     pushOutput(tab, { kind: "muted", text: "Session disconnected." });
     render();
+    scheduleCloudSync();
     return;
   }
   state.modal = "connect";
@@ -1479,6 +1589,7 @@ async function attemptConnection(request: ConnectionRequest, trustNewHost: boole
     await backend("Connect", tab.id, tab.serverId, request.password, request.rememberPassword, request.requireBiometric, trustNewHost);
     const refreshed = await backend("GetState");
     if (refreshed?.config) state.config = refreshed.config;
+    state.readiness = await backend("GetServerReadiness");
     state.pendingConnection = null;
     state.pendingHostFingerprint = "";
     tab.connection = "connected";
@@ -1522,6 +1633,7 @@ async function attemptConnection(request: ConnectionRequest, trustNewHost: boole
   }
   render();
   if (tab.connection === "connected") {
+    scheduleCloudSync();
     requestAnimationFrame(() => {
       fitTerminal(tab);
       if (tab.id === state.activeTabId) tab.terminal?.focus();
@@ -1668,8 +1780,10 @@ async function installSSHKey(event: SubmitEvent) {
   const generate = choice === "__generate__";
   try {
     state.config = await backend("InstallSSHKey", state.selectedId, generate ? "" : choice, password, generate);
+    state.readiness = await backend("GetServerReadiness");
     state.modal = "";
     pushOutput(activeTab(), { kind: "success", text: "SSH key installed · future connections can use the private key" });
+    scheduleCloudSync();
   } catch (error) {
     state.modal = "";
     pushOutput(activeTab(), { kind: "error", text: `Could not install SSH key: ${String(error)}` });
@@ -1692,6 +1806,7 @@ function attachRuntimeEvents() {
     if (event.message) pushOutput(tab, { kind: "error", text: event.message });
     if (event.state === "disconnected" && tab.lastRequest) scheduleReconnect(tab);
     render();
+    if (event.state === "disconnected") scheduleCloudSync();
   });
 }
 
@@ -1958,6 +2073,7 @@ function setTabTitle(tab: TerminalTab, value: string) {
   persistWorkspace();
   const title = document.querySelector<HTMLElement>(`[data-tab-title="${tab.id}"]`);
   if (title && !title.isContentEditable) title.textContent = tab.title;
+  scheduleCloudSync();
 }
 
 function isTerminalProtocolTitle(value: string) {
@@ -2111,7 +2227,7 @@ function recordRemoteDirectory(tab: TerminalTab, value: string) {
     const location = new URL(value);
     if (location.protocol !== "file:") return;
     const path = decodeURIComponent(location.pathname);
-    if (path) tab.remotePath = path;
+    if (path && path !== tab.remotePath) { tab.remotePath = path; scheduleCloudSync(); }
   } catch {
     // Ignore malformed or non-standard shell integration messages.
   }
@@ -2149,6 +2265,7 @@ async function initialise() {
     state.biometricAvailable = Boolean(initial?.biometricAvailable);
     state.biometricName = String(initial?.biometricName || "Device authentication");
     state.selectedId = state.config.servers[0]?.id ?? "";
+    state.readiness = await backend("GetServerReadiness");
   } catch {
     // Browser preview keeps the representative demo state.
   }
@@ -2161,6 +2278,7 @@ async function initialise() {
   attachRuntimeEvents();
   render();
   if (state.config.preferences.cloudUrl) void refreshCloudState();
+  window.setInterval(() => { if (state.cloud.signedIn && !state.cloudLoading) void syncCloudWorkspace(false); }, 20000);
   if (initialTab?.restoreSession && state.config.preferences.reopenActiveSession) {
     requestAnimationFrame(() => void autoConnectTab(initialTab, true));
   }

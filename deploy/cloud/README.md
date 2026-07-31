@@ -1,8 +1,9 @@
 # SSHKing Cloud deployment
 
 The cloud service stores account identity, team/server metadata, device sessions,
-and tmux resume/share handles. SSH private keys and passwords remain on each
-device and SSH connections continue directly from the desktop app to the target.
+and stable tab/tmux resume handles. SSH private keys, passwords, biometric
+preferences, and local identity paths remain on each device, and SSH connections
+continue directly from the desktop app to the target.
 
 Build `cmd/sshking-api` for Linux as `sshking-api`, place it beside the
 Dockerfile, copy `.env.example` to `.env`, then run:

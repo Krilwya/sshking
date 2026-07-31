@@ -226,6 +226,18 @@ func knownHostsCallback() (ssh.HostKeyCallback, error) {
 
 func (s *Session) HostKeyFingerprint() string { return s.hostKeyFingerprint }
 
+// AgentHasKeys reports whether the current device has at least one key loaded
+// in its SSH agent. It deliberately does not expose key material.
+func AgentHasKeys() bool {
+	conn, err := dialAgent()
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	keys, err := agent.NewClient(conn).List()
+	return err == nil && len(keys) > 0
+}
+
 func (s *Session) Output() <-chan string { return s.output }
 func (s *Session) Done() <-chan error    { return s.done }
 

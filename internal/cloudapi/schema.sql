@@ -96,6 +96,13 @@ CREATE TABLE IF NOT EXISTS session_shares (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS cloud_workspaces (
+    user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    revision bigint NOT NULL DEFAULT 0,
+    document jsonb NOT NULL DEFAULT '{}'::jsonb,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS device_sessions_user_idx ON device_sessions(user_id);
 CREATE INDEX IF NOT EXISTS cloud_servers_owner_idx ON cloud_servers(owner_id);
 CREATE INDEX IF NOT EXISTS cloud_servers_team_idx ON cloud_servers(team_id);

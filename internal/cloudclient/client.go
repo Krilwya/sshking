@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zalando/go-keyring"
@@ -52,7 +53,58 @@ type tokenResponse struct {
 	User         User   `json:"user"`
 }
 
-type Client struct{ HTTP *http.Client }
+type Client struct {
+	HTTP *http.Client
+	mu   sync.Mutex
+}
+
+type CloudServer struct {
+	ID           string `json:"id"`
+	TeamID       string `json:"teamId,omitempty"`
+	Name         string `json:"name"`
+	Group        string `json:"group,omitempty"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	User         string `json:"user"`
+	Shell        string `json:"shell"`
+	UseTmux      bool   `json:"useTmux,omitempty"`
+	TmuxSession  string `json:"tmuxSession,omitempty"`
+	JumpServerID string `json:"jumpServerId,omitempty"`
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	Favorite     bool   `json:"favorite,omitempty"`
+}
+
+type CloudTeam struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type CloudTab struct {
+	ID          string `json:"id"`
+	ServerID    string `json:"serverId"`
+	Title       string `json:"title"`
+	ManualTitle bool   `json:"manualTitle,omitempty"`
+	Restore     bool   `json:"restore,omitempty"`
+	LastPath    string `json:"lastPath,omitempty"`
+	Position    int    `json:"position,omitempty"`
+}
+
+type WorkspacePatch struct {
+	Servers         []CloudServer `json:"servers"`
+	Teams           []CloudTeam   `json:"teams"`
+	Tabs            []CloudTab    `json:"tabs"`
+	DeleteServerIDs []string      `json:"deleteServerIds"`
+	DeleteTeamIDs   []string      `json:"deleteTeamIds"`
+	DeleteTabIDs    []string      `json:"deleteTabIds"`
+}
+
+type Workspace struct {
+	Revision  int64         `json:"revision"`
+	Servers   []CloudServer `json:"servers"`
+	Teams     []CloudTeam   `json:"teams"`
+	Tabs      []CloudTab    `json:"tabs"`
+	UpdatedAt string        `json:"updatedAt"`
+}
 
 func New() *Client { return &Client{HTTP: &http.Client{Timeout: 15 * time.Second}} }
 
@@ -188,6 +240,53 @@ func (c *Client) Logout(raw string) error {
 	return deleteSession(base)
 }
 
+func (c *Client) Workspace(ctx context.Context, raw string) (Workspace, error) {
+	base, sess, err := c.authorizedSession(ctx, raw)
+	if err != nil {
+		return Workspace{}, err
+	}
+	var workspace Workspace
+	if err := c.getJSON(ctx, base+"/v1/workspace", sess.AccessToken, &workspace); err != nil {
+		return Workspace{}, err
+	}
+	return workspace, nil
+}
+
+func (c *Client) SyncWorkspace(ctx context.Context, raw string, patch WorkspacePatch) (Workspace, error) {
+	base, sess, err := c.authorizedSession(ctx, raw)
+	if err != nil {
+		return Workspace{}, err
+	}
+	var workspace Workspace
+	if err := c.postJSONAuthorized(ctx, base+"/v1/workspace/sync", sess.AccessToken, patch, &workspace); err != nil {
+		return Workspace{}, err
+	}
+	return workspace, nil
+}
+
+func (c *Client) authorizedSession(ctx context.Context, raw string) (string, session, error) {
+	base, err := normalizeBase(raw)
+	if err != nil {
+		return "", session{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sess, err := loadSession(base)
+	if err != nil {
+		return "", session{}, errors.New("sign in to SSHKing Cloud first")
+	}
+	if time.Now().After(sess.ExpiresAt.Add(-30 * time.Second)) {
+		sess, err = c.refresh(ctx, base, sess.RefreshToken)
+		if err != nil {
+			return "", session{}, err
+		}
+		if err = saveSession(base, sess); err != nil {
+			return "", session{}, err
+		}
+	}
+	return base, sess, nil
+}
+
 func (c *Client) refresh(ctx context.Context, base, refreshToken string) (session, error) {
 	var token tokenResponse
 	if err := c.postJSON(ctx, base+"/v1/auth/refresh", map[string]string{"refreshToken": refreshToken}, &token); err != nil {
@@ -206,6 +305,9 @@ func (c *Client) getJSON(ctx context.Context, endpoint, bearer string, target an
 	return c.do(req, target)
 }
 func (c *Client) postJSON(ctx context.Context, endpoint string, input, target any) error {
+	return c.postJSONAuthorized(ctx, endpoint, "", input, target)
+}
+func (c *Client) postJSONAuthorized(ctx context.Context, endpoint, bearer string, input, target any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return err
@@ -215,6 +317,9 @@ func (c *Client) postJSON(ctx context.Context, endpoint string, input, target an
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	return c.do(req, target)
 }
 func (c *Client) do(req *http.Request, target any) error {

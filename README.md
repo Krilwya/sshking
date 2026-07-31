@@ -9,6 +9,9 @@ system webview.
 - Searchable, persistent server library
 - Foldable Personal Servers and Team Servers workspaces
 - Local team creation, renaming, and server ownership assignment
+- Google-backed cross-device server and terminal-tab synchronization
+- Per-device SSH credential readiness indicators without uploading secrets
+- Stable cloud tab IDs that reattach to the same remote tmux sessions
 - Pure-Go SSH transport (no local `ssh` child process)
 - Configurable remote shell (`default`, `zsh`, `bash`, or `fish`)
 - SSH agent and private-key authentication

@@ -41,6 +41,7 @@ type App struct {
 	mu                 sync.Mutex
 	biometricAvailable bool
 	cloud              *cloudclient.Client
+	cloudMu            sync.Mutex
 }
 
 type managedSession struct {
@@ -70,6 +71,20 @@ type RemoteFile struct {
 	Size    int64  `json:"size"`
 	Mode    string `json:"mode"`
 	ModTime int64  `json:"modTime"`
+}
+
+type ServerReadiness struct {
+	Ready       bool   `json:"ready"`
+	HasKey      bool   `json:"hasKey"`
+	HasPassword bool   `json:"hasPassword"`
+	HasAgent    bool   `json:"hasAgent"`
+	Message     string `json:"message"`
+}
+
+type CloudSyncResult struct {
+	Config    config.Config              `json:"config"`
+	Workspace cloudclient.Workspace      `json:"workspace"`
+	Readiness map[string]ServerReadiness `json:"readiness"`
 }
 
 func NewApp() (*App, error) {
@@ -115,6 +130,99 @@ func (a *App) LoginCloud(cloudURL, provider string) (cloudclient.State, error) {
 
 func (a *App) LogoutCloud(cloudURL string) error {
 	return a.cloud.Logout(cloudURL)
+}
+
+func (a *App) GetServerReadiness() map[string]ServerReadiness {
+	a.mu.Lock()
+	servers := append([]config.Server(nil), a.cfg.Servers...)
+	a.mu.Unlock()
+	return serverReadiness(servers)
+}
+
+func (a *App) SyncCloudWorkspace(cloudURL string, tabs []cloudclient.CloudTab, deleteTabIDs, deleteServerIDs, deleteTeamIDs []string) (CloudSyncResult, error) {
+	a.cloudMu.Lock()
+	defer a.cloudMu.Unlock()
+	a.mu.Lock()
+	local := a.cfg
+	a.mu.Unlock()
+	patch := cloudclient.WorkspacePatch{Tabs: tabs, DeleteTabIDs: deleteTabIDs, DeleteServerIDs: deleteServerIDs, DeleteTeamIDs: deleteTeamIDs}
+	for _, server := range local.Servers {
+		patch.Servers = append(patch.Servers, cloudclient.CloudServer{
+			ID: server.ID, TeamID: server.TeamID, Name: server.Name, Group: server.Group,
+			Host: server.Host, Port: server.Port, User: server.User, Shell: server.Shell,
+			UseTmux: server.UseTmux, TmuxSession: server.TmuxSession, JumpServerID: server.JumpServerID,
+			Fingerprint: server.Fingerprint, Favorite: server.Favorite,
+		})
+	}
+	for _, team := range local.Teams {
+		patch.Teams = append(patch.Teams, cloudclient.CloudTeam{ID: team.ID, Name: team.Name})
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+	defer cancel()
+	workspace, err := a.cloud.SyncWorkspace(ctx, cloudURL, patch)
+	if err != nil {
+		return CloudSyncResult{}, err
+	}
+	localByID := make(map[string]config.Server, len(local.Servers))
+	for _, server := range local.Servers {
+		localByID[server.ID] = server
+	}
+	merged := make([]config.Server, 0, len(workspace.Servers))
+	for _, remote := range workspace.Servers {
+		server := config.Server{ID: remote.ID, TeamID: remote.TeamID, Name: remote.Name, Group: remote.Group, Host: remote.Host, Port: remote.Port, User: remote.User, Shell: remote.Shell, UseTmux: remote.UseTmux, TmuxSession: remote.TmuxSession, JumpServerID: remote.JumpServerID, Fingerprint: remote.Fingerprint, Favorite: remote.Favorite}
+		if device, exists := localByID[remote.ID]; exists {
+			server.Identity = device.Identity
+			server.PasswordSaved = device.PasswordSaved
+			server.RequireBiometric = device.RequireBiometric
+		}
+		merged = append(merged, server)
+	}
+	teams := make([]config.Team, 0, len(workspace.Teams))
+	for _, team := range workspace.Teams {
+		teams = append(teams, config.Team{ID: team.ID, Name: team.Name})
+	}
+	a.mu.Lock()
+	a.cfg.Servers = merged
+	a.cfg.Teams = teams
+	saveErr := a.store.Save(a.cfg)
+	resultConfig := a.cfg
+	a.mu.Unlock()
+	if saveErr != nil {
+		return CloudSyncResult{}, saveErr
+	}
+	return CloudSyncResult{Config: resultConfig, Workspace: workspace, Readiness: serverReadiness(merged)}, nil
+}
+
+func serverReadiness(servers []config.Server) map[string]ServerReadiness {
+	result := make(map[string]ServerReadiness, len(servers))
+	agentReady := sshclient.AgentHasKeys()
+	for _, server := range servers {
+		status := ServerReadiness{HasAgent: agentReady}
+		if strings.TrimSpace(server.Identity) != "" {
+			identity := server.Identity
+			if identity == "~" || strings.HasPrefix(identity, "~/") || strings.HasPrefix(identity, `~\`) {
+				if home, err := os.UserHomeDir(); err == nil {
+					identity = filepath.Join(home, strings.TrimLeft(identity[1:], `/\`))
+				}
+			}
+			if info, err := os.Stat(identity); err == nil && !info.IsDir() {
+				status.HasKey = true
+			} else {
+				status.Message = "Private key is missing on this device"
+			}
+		}
+		if server.PasswordSaved {
+			if _, err := credentials.Get(server.ID); err == nil {
+				status.HasPassword = true
+			}
+		}
+		status.Ready = status.HasKey || status.HasPassword || (strings.TrimSpace(server.Identity) == "" && status.HasAgent)
+		if !status.Ready && status.Message == "" {
+			status.Message = "Add a password or SSH key on this device"
+		}
+		result[server.ID] = status
+	}
+	return result
 }
 
 func (a *App) startup(ctx context.Context) {

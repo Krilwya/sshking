@@ -42,6 +42,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/auth/token", s.authToken)
 	s.mux.HandleFunc("POST /v1/auth/refresh", s.authRefresh)
 	s.mux.HandleFunc("GET /v1/me", s.me)
+	s.mux.HandleFunc("GET /v1/workspace", s.getWorkspace)
+	s.mux.HandleFunc("POST /v1/workspace/sync", s.syncWorkspace)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -233,25 +235,33 @@ func (s *Server) issueSession(ctx context.Context, u user, device string, w http
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	setNoStore(w)
-	parts := strings.Fields(r.Header.Get("Authorization"))
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		writeError(w, 401, "missing bearer token")
-		return
-	}
-	u, err := s.store.userByAccess(r.Context(), tokenHash(parts[1]))
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, 401, "invalid or expired access token")
-		return
-	}
-	if err != nil {
-		writeError(w, 500, "could not load account")
+	u, ok := s.requireUser(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, 200, u)
 }
 
+func (s *Server) requireUser(w http.ResponseWriter, r *http.Request) (user, bool) {
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		writeError(w, 401, "missing bearer token")
+		return user{}, false
+	}
+	u, err := s.store.userByAccess(r.Context(), tokenHash(parts[1]))
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 401, "invalid or expired access token")
+		return user{}, false
+	}
+	if err != nil {
+		writeError(w, 500, "could not load account")
+		return user{}, false
+	}
+	return u, true
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 	if err := d.Decode(target); err != nil {
