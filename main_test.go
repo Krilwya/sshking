@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestApplicationOptionsUseNativeMacWindowChrome(t *testing.T) {
 	options := applicationOptions(&App{}, "darwin")
@@ -33,5 +36,34 @@ func TestApplicationOptionsKeepCustomWindowsChrome(t *testing.T) {
 	}
 	if options.Windows.DisableFramelessWindowDecorations {
 		t.Fatal("DWM decorations are required for native shadow and rounded corners")
+	}
+	if options.Windows.WebviewGpuIsDisabled {
+		t.Fatal("Windows WebView GPU must remain enabled for terminal rendering")
+	}
+}
+
+func TestValidTmuxSessionName(t *testing.T) {
+	for _, name := range []string{"sshking", "sshking-prod_2", "A1"} {
+		if !validTmuxSessionName(name) {
+			t.Fatalf("expected valid tmux session name: %q", name)
+		}
+	}
+	for _, name := range []string{"", "bad.name", "bad:name", "bad name", "$(command)"} {
+		if validTmuxSessionName(name) {
+			t.Fatalf("expected invalid tmux session name: %q", name)
+		}
+	}
+}
+
+func TestTmuxSessionIsScopedToStableTab(t *testing.T) {
+	first := tmuxSessionForTab("sshking", "tab-one")
+	if first != tmuxSessionForTab("sshking", "tab-one") {
+		t.Fatal("the same tab must retain its tmux session name")
+	}
+	if first == tmuxSessionForTab("sshking", "tab-two") {
+		t.Fatal("different tabs must use different tmux sessions")
+	}
+	if !strings.HasPrefix(first, "sshking-") || len(first) > 64 {
+		t.Fatalf("unexpected scoped tmux name: %q", first)
 	}
 }

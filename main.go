@@ -46,7 +46,9 @@ func applicationOptions(application *App, platform string) *options.App {
 			WebviewIsTransparent: true,
 			WindowIsTranslucent:  true,
 			BackdropType:         windows.Acrylic,
-			WebviewGpuIsDisabled: true,
+			// xterm renders to canvas and the glass UI relies on compositing.
+			// Software rendering makes terminal and palette scrolling stutter.
+			WebviewGpuIsDisabled: false,
 			// Retain DWM's native shadow and Windows 11 rounded corners around
 			// the custom title bar.
 			DisableFramelessWindowDecorations: false,

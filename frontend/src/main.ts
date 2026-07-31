@@ -2,15 +2,20 @@ import "./style.css";
 import "@xterm/xterm/css/xterm.css";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 
 type Server = {
   id: string;
   name: string;
+  group?: string;
   host: string;
   port: number;
   user: string;
   shell: string;
+  useTmux?: boolean;
+  tmuxSession?: string;
   identity?: string;
+  jumpServerId?: string;
   fingerprint?: string;
   favorite?: boolean;
   passwordSaved?: boolean;
@@ -24,6 +29,14 @@ type Preferences = {
   defaultIdentity?: string;
   logActivity: boolean;
   scrollback: number;
+  theme: "light" | "black" | "glass";
+  uiScale: number;
+  terminalFontSize: number;
+  terminalFontFamily: "system-mono" | "cascadia" | "jetbrains" | "source-code";
+  terminalLineHeight: number;
+  autoConnectTabs: boolean;
+  reopenActiveSession: boolean;
+  persistTerminalHistory: boolean;
 };
 
 type Config = { servers: Server[]; preferences: Preferences };
@@ -36,9 +49,54 @@ type PublicKeyInfo = {
 };
 type ConnectionState = "idle" | "connecting" | "connected" | "error";
 type ConnectionRequest = {
+  tabId: string;
   password: string;
   rememberPassword: boolean;
   requireBiometric: boolean;
+};
+type RemoteFile = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  mode: string;
+  modTime: number;
+};
+type TunnelInfo = {
+  id: string;
+  sessionId: string;
+  local: string;
+  remoteHost: string;
+  remotePort: number;
+};
+type OutputLine = { kind: string; text: string };
+type TerminalTab = {
+  id: string;
+  serverId: string;
+  title: string;
+  manualTitle: boolean;
+  connection: ConnectionState;
+  output: OutputLine[];
+  remotePath: string;
+  terminal?: Terminal;
+  fitAddon?: FitAddon;
+  searchAddon?: SearchAddon;
+  host?: HTMLDivElement;
+  inputQueue: string;
+  sendingInput: boolean;
+  resizeTimer?: number;
+  bookmarks: { id: string; label: string; line: number }[];
+  lastRequest?: ConnectionRequest;
+  reconnectAttempts: number;
+  reconnectTimer?: number;
+  pendingTerminalData: string;
+  terminalWriteScheduled: boolean;
+  restoreSession: boolean;
+  restoredTranscript: string;
+  commandBuffer: string;
+  commandCursor: number;
+  commandHistory: string[];
+  commandHistoryIndex: number;
 };
 
 declare global {
@@ -48,6 +106,7 @@ declare global {
       WindowMinimise(): void;
       WindowToggleMaximise(): void;
       Quit(): void;
+      ClipboardSetText(text: string): Promise<boolean>;
       EventsOn(name: string, callback: (...args: unknown[]) => void): () => void;
     };
   }
@@ -69,7 +128,7 @@ const icons = {
 
 const demoConfig: Config = {
   servers: [
-    { id: "demo-1", name: "Production", host: "api.northstar.dev", port: 22, user: "deploy", shell: "zsh", identity: "~/.ssh/id_ed25519", favorite: true, passwordSaved: true, requireBiometric: true },
+    { id: "demo-1", name: "Production", host: "api.northstar.dev", port: 22, user: "deploy", shell: "zsh", useTmux: true, tmuxSession: "sshking", identity: "~/.ssh/id_ed25519", favorite: true, passwordSaved: true, requireBiometric: true },
     { id: "demo-2", name: "Staging", host: "stage.northstar.dev", port: 22, user: "ubuntu", shell: "bash", favorite: true },
     { id: "demo-3", name: "Home lab", host: "192.168.1.42", port: 22, user: "operator", shell: "fish" },
   ],
@@ -80,6 +139,14 @@ const demoConfig: Config = {
     defaultIdentity: "~/.ssh/id_ed25519",
     logActivity: true,
     scrollback: 2000,
+    theme: "glass",
+    uiScale: 100,
+    terminalFontSize: 14,
+    terminalFontFamily: "system-mono",
+    terminalLineHeight: 140,
+    autoConnectTabs: true,
+    reopenActiveSession: true,
+    persistTerminalHistory: true,
   },
 };
 
@@ -88,28 +155,28 @@ const state = {
   platform: detectedPlatform(),
   selectedId: demoConfig.servers[0]?.id ?? "",
   query: "",
-  connection: "idle" as ConnectionState,
-  output: [
-    { kind: "system", text: "SSHKing secure terminal · session ready" },
-    { kind: "muted", text: "Select a server and connect when you’re ready." },
-  ],
-  modal: "" as "" | "server" | "settings" | "connect" | "zed" | "ssh-key" | "trust-host-key",
+  tabs: [] as TerminalTab[],
+  activeTabId: "",
+  splitTabId: "",
+  modal: "" as "" | "server" | "settings" | "activity" | "connect" | "zed" | "ssh-key" | "files" | "tunnels" | "palette" | "trust-host-key",
   editingId: "",
   sshKeys: [] as PublicKeyInfo[],
-  remotePaths: {} as Record<string, string>,
   biometricAvailable: false,
   biometricName: "Device authentication",
   pendingConnection: null as ConnectionRequest | null,
   pendingHostFingerprint: "",
+  remoteFiles: [] as RemoteFile[],
+  browsingPath: "~",
+  filesLoading: false,
+  tunnels: [] as TunnelInfo[],
+  paletteQuery: "",
+  terminalSearch: false,
+  terminalSearchQuery: "",
+  activity: [] as string[],
 };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
-let terminal: Terminal | undefined;
-let fitAddon: FitAddon | undefined;
-let terminalHost: HTMLDivElement | undefined;
-let inputQueue = "";
-let sendingInput = false;
-let resizeTimer: number | undefined;
+let copyToastTimer: number | undefined;
 
 function backend(name: string, ...args: unknown[]): Promise<any> {
   const fn = window.go?.main?.App?.[name];
@@ -119,7 +186,6 @@ function backend(name: string, ...args: unknown[]): Promise<any> {
 
 async function mockBackend(name: string, args: unknown[]) {
   if (name === "GetState") {
-    state.remotePaths["demo-1"] = "/srv/northstar";
     return {
       config: demoConfig,
       platform: detectedPlatform(),
@@ -143,9 +209,11 @@ async function mockBackend(name: string, args: unknown[]) {
     state.config.preferences = args[0] as Preferences;
     return state.config;
   }
+  if (name === "GetSessionTranscript") return "";
+  if (name === "ClearSessionTranscript" || name === "ClearTerminalHistory") return;
   if (name === "Connect") {
     await new Promise((resolve) => setTimeout(resolve, 650));
-    const selected = state.config.servers.find((server) => server.id === args[0]);
+    const selected = state.config.servers.find((server) => server.id === args[1]);
     if (selected && !selected.fingerprint) selected.fingerprint = "SHA256:demoHostFingerprint";
     return;
   }
@@ -159,13 +227,195 @@ async function mockBackend(name: string, args: unknown[]) {
     if (selected) selected.identity = args[3] ? `~/.ssh/sshking_${selected.name.toLowerCase().replace(/\W+/g, "_")}` : String(args[1]).replace(/\.pub$/i, "");
     return state.config;
   }
+  if (name === "ImportSSHConfig") return state.config;
+  if (name === "ListRemoteFiles") return [
+    { name: "src", path: "/srv/northstar/src", isDir: true, size: 0, mode: "drwxr-xr-x", modTime: Date.now() / 1000 },
+    { name: "README.md", path: "/srv/northstar/README.md", isDir: false, size: 4210, mode: "-rw-r--r--", modTime: Date.now() / 1000 },
+  ];
+  if (name === "StartLocalTunnel") return { id: `tunnel-${Date.now()}`, sessionId: args[0], local: `127.0.0.1:${args[1] || 49152}`, remoteHost: args[2], remotePort: args[3] };
+  if (name === "GetActivity") return [
+    "2026-07-30-Production.log  2026-07-30T15:22:01+02:00 [connect] deploy@api.northstar.dev",
+    "2026-07-30-Production.log  2026-07-30T15:22:09+02:00 [command] git status",
+  ];
+}
+
+function newTerminalTab(serverId = state.selectedId, tabId = ""): TerminalTab {
+  const server = state.config.servers.find((item) => item.id === serverId);
+  return {
+    id: tabId || crypto.randomUUID?.() || `terminal-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    serverId,
+    title: server?.name ?? "Terminal",
+    manualTitle: false,
+    connection: "idle",
+    output: [
+      { kind: "system", text: "SSHKing secure terminal · session ready" },
+      { kind: "muted", text: server ? "Press Connect to open this server." : "Select a server and connect when you’re ready." },
+    ],
+    remotePath: "~",
+    inputQueue: "",
+    sendingInput: false,
+    bookmarks: [],
+    reconnectAttempts: 0,
+    pendingTerminalData: "",
+    terminalWriteScheduled: false,
+    restoreSession: false,
+    restoredTranscript: "",
+    commandBuffer: "",
+    commandCursor: 0,
+    commandHistory: [],
+    commandHistoryIndex: 0,
+  };
+}
+
+function restoreWorkspace() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("sshking.workspace.v1") ?? "{}") as {
+      serverIds?: string[];
+      tabIds?: string[];
+      titles?: string[];
+      manualTitles?: boolean[];
+      activeIndex?: number;
+      splitIndex?: number;
+      sessionOpen?: boolean[];
+    };
+    const knownServers = new Set(state.config.servers.map((server) => server.id));
+    const serverIds = (saved.serverIds ?? []).filter((id) => knownServers.has(id)).slice(0, 12);
+    state.tabs = (serverIds.length ? serverIds : [state.selectedId]).map((id, index) => newTerminalTab(id, saved.tabIds?.[index] ?? ""));
+    state.tabs.forEach((tab, index) => {
+      const savedTitle = saved.titles?.[index]?.trim();
+      if (savedTitle) tab.title = savedTitle;
+      tab.manualTitle = Boolean(saved.manualTitles?.[index]);
+      if (!tab.manualTitle && isTerminalProtocolTitle(tab.title)) {
+        tab.title = state.config.servers.find((server) => server.id === tab.serverId)?.name ?? "Terminal";
+      }
+    });
+    const activeIndex = Math.min(Math.max(saved.activeIndex ?? 0, 0), state.tabs.length - 1);
+    state.tabs.forEach((tab, index) => {
+      tab.restoreSession = saved.sessionOpen?.[index] ?? index === activeIndex;
+    });
+    state.activeTabId = state.tabs[activeIndex]?.id ?? "";
+    state.selectedId = state.tabs[activeIndex]?.serverId ?? state.selectedId;
+    if (typeof saved.splitIndex === "number" && saved.splitIndex >= 0 && saved.splitIndex < state.tabs.length && saved.splitIndex !== activeIndex) {
+      state.splitTabId = state.tabs[saved.splitIndex].id;
+    }
+  } catch {
+    state.tabs = [newTerminalTab(state.selectedId)];
+    state.activeTabId = state.tabs[0].id;
+  }
+}
+
+function persistWorkspace() {
+  try {
+    localStorage.setItem("sshking.workspace.v1", JSON.stringify({
+      serverIds: state.tabs.map((tab) => tab.serverId),
+      tabIds: state.tabs.map((tab) => tab.id),
+      titles: state.tabs.map((tab) => tab.title),
+      manualTitles: state.tabs.map((tab) => tab.manualTitle),
+      activeIndex: Math.max(0, state.tabs.findIndex((tab) => tab.id === state.activeTabId)),
+      splitIndex: state.tabs.findIndex((tab) => tab.id === state.splitTabId),
+      sessionOpen: state.tabs.map((tab) => tab.restoreSession || tab.connection === "connected" || tab.connection === "connecting"),
+    }));
+  } catch {
+    // Workspace persistence is a convenience; private WebViews may disable storage.
+  }
+}
+
+function activeTab() {
+  return state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0];
+}
+
+function visibleTabs() {
+  const active = activeTab();
+  const split = state.tabs.find((tab) => tab.id === state.splitTabId);
+  return [active, split && split.id !== active?.id ? split : undefined].filter(Boolean) as TerminalTab[];
+}
+
+function selectTab(tabId: string, focusTerminal = true) {
+  const tab = state.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+  state.activeTabId = tab.id;
+  state.selectedId = tab.serverId;
+  render();
+  requestAnimationFrame(() => {
+    if (focusTerminal) tab.terminal?.focus();
+    if (focusTerminal && tab.restoreSession && tab.connection === "idle") void autoConnectTab(tab, true);
+  });
+}
+
+function addTerminalTab(serverId = state.selectedId) {
+  const tab = newTerminalTab(serverId);
+  state.tabs.push(tab);
+  state.activeTabId = tab.id;
+  state.selectedId = tab.serverId;
+  render();
+  requestAnimationFrame(() => {
+    tab.terminal?.focus();
+    void autoConnectTab(tab);
+  });
+}
+
+async function closeTerminalTab(tabId: string) {
+  const index = state.tabs.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return;
+  const [tab] = state.tabs.splice(index, 1);
+  tab.restoreSession = false;
+  tab.lastRequest = undefined;
+  window.clearTimeout(tab.reconnectTimer);
+  tab.reconnectTimer = undefined;
+  if (tab.connection === "connected" || tab.connection === "connecting") {
+    await backend("Disconnect", tab.id).catch(() => undefined);
+  }
+  await backend("ClearSessionTranscript", tab.id).catch(() => undefined);
+  state.tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId !== tab.id);
+  tab.terminal?.dispose();
+  if (state.splitTabId === tab.id) state.splitTabId = "";
+  if (!state.tabs.length) state.tabs.push(newTerminalTab());
+  if (state.activeTabId === tab.id) {
+    const next = state.tabs[Math.min(index, state.tabs.length - 1)];
+    state.activeTabId = next.id;
+    state.selectedId = next.serverId;
+  }
+  render();
+}
+
+function toggleSplitPane() {
+  let created: TerminalTab | undefined;
+  if (state.splitTabId) {
+    state.splitTabId = "";
+  } else {
+    let split = state.tabs.find((tab) => tab.id !== state.activeTabId);
+    if (!split) {
+      split = newTerminalTab(state.selectedId);
+      state.tabs.push(split);
+      created = split;
+    }
+    state.splitTabId = split.id;
+  }
+  render();
+  if (created) requestAnimationFrame(() => void autoConnectTab(created));
+}
+
+async function autoConnectTab(tab: TerminalTab, force = false) {
+  if ((!force && !state.config.preferences.autoConnectTabs) || !tab.serverId || tab.connection !== "idle") return;
+  const server = state.config.servers.find((item) => item.id === tab.serverId);
+  if (!server) return;
+  await attemptConnection({
+    tabId: tab.id,
+    password: "",
+    rememberPassword: Boolean(server.passwordSaved),
+    requireBiometric: Boolean(server.requireBiometric),
+  }, false);
 }
 
 function render() {
-  const selected = state.config.servers.find((server) => server.id === state.selectedId);
-  if (terminalHost?.isConnected) terminalHost.remove();
+  persistWorkspace();
+  const active = activeTab();
+  const selected = state.config.servers.find((server) => server.id === active?.serverId);
+  for (const tab of state.tabs) {
+    if (tab.host?.isConnected) tab.host.remove();
+  }
   app.innerHTML = `
-    <main class="window-shell platform-${state.platform}">
+    <main class="window-shell platform-${state.platform} theme-${state.config.preferences.theme}" style="--ui-scale:${state.config.preferences.uiScale / 100}">
       <div class="ambient ambient-a"></div>
       <div class="ambient ambient-b"></div>
       <header class="titlebar">
@@ -174,8 +424,8 @@ function render() {
           <span>SSHKing</span>
         </div>
         <div class="session-island">
-          <span class="status-dot ${state.connection}"></span>
-          <span>${connectionLabel()}</span>
+          <span class="status-dot ${active?.connection ?? "idle"}"></span>
+          <span>${connectionLabel(active)}</span>
         </div>
         ${windowControlsMarkup()}
       </header>
@@ -187,7 +437,10 @@ function render() {
               <span class="eyebrow">Your space</span>
               <h1>Servers</h1>
             </div>
-            <button class="orb-button" id="add-server" aria-label="Add server">${icons.plus}</button>
+            <div class="sidebar-heading-actions">
+              <button class="orb-button import-button" id="import-ssh-config" aria-label="Import SSH config" title="Import ~/.ssh/config">⇩</button>
+              <button class="orb-button" id="add-server" aria-label="Add server">${icons.plus}</button>
+            </div>
           </div>
           <label class="searchbox">
             ${icons.search}
@@ -215,34 +468,47 @@ function render() {
             </div>
             <div class="toolbar-actions">
               <button class="key-button" id="setup-key" ${selected ? "" : "disabled"} aria-label="Set up SSH key">${icons.key}<span>Key</span></button>
+              <button class="key-button" id="open-files" ${active?.connection === "connected" ? "" : "disabled"} aria-label="Browse remote files">${icons.server}<span>Files</span></button>
+              <button class="key-button" id="open-tunnels" ${active?.connection === "connected" ? "" : "disabled"} aria-label="Manage port forwards">${icons.arrow}<span>Tunnels</span></button>
               <div class="zed-split">
                 <button class="zed-button" id="open-zed-direct" ${selected ? "" : "disabled"} aria-label="Open current folder in Zed">${icons.code}<span>Zed</span></button>
                 <button class="zed-options" id="open-zed-options" ${selected ? "" : "disabled"} aria-label="Zed options">${icons.more}</button>
               </div>
               <button class="icon-button" id="edit-server" ${selected ? "" : "disabled"} aria-label="Edit server">${icons.more}</button>
-              <button class="connect-button ${state.connection === "connected" ? "connected" : ""}" id="connect-button" ${selected ? "" : "disabled"}>
-                <span>${state.connection === "connected" ? "Disconnect" : state.connection === "connecting" ? "Connecting…" : "Connect"}</span>
+              <button class="connect-button ${active?.connection === "connected" ? "connected" : ""}" id="connect-button" ${selected ? "" : "disabled"}>
+                <span>${active?.connection === "connected" ? "Disconnect" : active?.connection === "connecting" ? "Connecting…" : "Connect"}</span>
                 ${icons.arrow}
               </button>
             </div>
           </div>
 
           <div class="tabbar">
-            <button class="terminal-tab active"><span class="status-dot ${state.connection}"></span>${escapeHtml(selected?.name ?? "Terminal")}</button>
-            <button class="new-tab" aria-label="New terminal">${icons.plus}</button>
+            <div class="terminal-tabs">${state.tabs.map((tab) => `<button class="terminal-tab ${tab.id === state.activeTabId ? "active" : ""}" data-tab="${tab.id}" title="${escapeHtml(tab.manualTitle ? "Custom name · click to rename" : "Last command · click to set a permanent name")}"><span class="status-dot ${tab.connection}"></span><span class="tab-title" data-tab-title="${tab.id}">${escapeHtml(tab.title)}</span><i class="tab-close" data-close-tab="${tab.id}" aria-label="Close terminal">×</i></button>`).join("")}</div>
+            <button class="new-tab" id="new-terminal-tab" aria-label="New terminal">${icons.plus}</button>
+            <button class="split-button ${state.splitTabId ? "active" : ""}" id="toggle-split" aria-label="Toggle split terminal" title="Split terminal">▥</button>
             <span class="encryption"><i></i> end-to-end SSH</span>
           </div>
 
           <div class="terminal-stage" id="terminal-stage">
             <div class="terminal-glow"></div>
-            <div class="terminal-output" id="terminal-output"></div>
+            ${state.terminalSearch ? `<div class="terminal-searchbar">
+              ${icons.search}<input id="terminal-search-input" value="${escapeHtml(state.terminalSearchQuery)}" placeholder="Find in terminal">
+              <button id="terminal-search-previous" title="Previous result">↑</button><button id="terminal-search-next" title="Next result">↓</button>
+              <button id="add-terminal-bookmark" title="Bookmark current position">☆</button>
+              ${active?.bookmarks.map((bookmark) => `<button class="terminal-bookmark" data-terminal-bookmark="${bookmark.line}" title="${escapeHtml(bookmark.label)}">${escapeHtml(bookmark.label)}</button>`).join("") ?? ""}
+              <button id="close-terminal-search" title="Close">×</button>
+            </div>` : ""}
+            <div class="terminal-layout ${state.splitTabId ? "split" : ""}">
+              ${visibleTabs().map((tab) => `<div class="terminal-pane ${tab.id === state.activeTabId ? "active" : ""}" data-pane-tab="${tab.id}"><div class="terminal-output" data-terminal-slot="${tab.id}"></div></div>`).join("")}
+            </div>
+            <div class="terminal-copy-toast" id="terminal-copy-toast">Copied</div>
           </div>
         </section>
       </section>
       ${state.modal ? modalMarkup() : ""}
     </main>`;
   bindEvents();
-  mountTerminal();
+  mountVisibleTerminals();
 }
 
 function windowControlsMarkup() {
@@ -264,7 +530,12 @@ function serverList() {
   }
   const favorite = servers.filter((server) => server.favorite);
   const others = servers.filter((server) => !server.favorite);
-  return [groupMarkup("Pinned", favorite), groupMarkup("All servers", others)].join("");
+  const grouped = new Map<string, Server[]>();
+  for (const server of others) {
+    const label = server.group?.trim() || "All servers";
+    grouped.set(label, [...(grouped.get(label) ?? []), server]);
+  }
+  return [groupMarkup("Pinned", favorite), ...Array.from(grouped, ([label, items]) => groupMarkup(label, items))].join("");
 }
 
 function groupMarkup(label: string, servers: Server[]) {
@@ -274,14 +545,74 @@ function groupMarkup(label: string, servers: Server[]) {
 
 function serverCard(server: Server) {
   const active = server.id === state.selectedId;
+  const online = state.tabs.some((tab) => tab.serverId === server.id && tab.connection === "connected");
   return `<button class="server-card ${active ? "active" : ""}" data-server="${escapeHtml(server.id)}">
     <span class="server-avatar">${initials(server.name)}</span>
     <span class="server-copy"><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml(server.user)}@${escapeHtml(server.host)}</small></span>
-    <span class="server-state ${active && state.connection === "connected" ? "online" : ""}"></span>
+    <span class="server-state ${online ? "online" : ""}"></span>
   </button>`;
 }
 
 function modalMarkup() {
+  if (state.modal === "activity") {
+    return `<div class="modal-backdrop"><section class="modal glass-modal activity-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">Local history</span><h2>Activity log</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">The newest opt-in events are shown first. Logs stay on this device.</p>
+      <div class="activity-list">${state.activity.map((line) => `<div class="activity-line">${escapeHtml(line)}</div>`).join("") || `<div class="files-empty">No activity has been logged.</div>`}</div>
+      <div class="modal-actions"><span class="modal-note-inline">Disable activity logs in Preferences for private sessions.</span><button type="button" class="ghost modal-close">Close</button></div>
+    </section></div>`;
+  }
+  if (state.modal === "palette") {
+    return `<div class="modal-backdrop palette-backdrop"><section class="modal glass-modal palette-modal">
+      <label class="palette-search">${icons.search}<input id="palette-input" value="${escapeHtml(state.paletteQuery)}" placeholder="Search actions or type a shell command…" autocomplete="off" spellcheck="false"><kbd>Esc</kbd></label>
+      <div class="palette-results">
+        ${paletteActions().map((action) => `<button type="button" class="palette-action" data-palette-action="${action.id}" data-palette-search="${escapeHtml(`${action.label} ${action.detail}`.toLowerCase())}">
+          <span>${action.icon}</span><span><strong>${escapeHtml(action.label)}</strong><small>${escapeHtml(action.detail)}</small></span>${action.shortcut ? `<kbd>${escapeHtml(action.shortcut)}</kbd>` : ""}
+        </button>`).join("")}
+      </div>
+      <div class="palette-footer"><span>Type any command and press Enter to send it to the active terminal.</span><span>↑↓ Navigate · Enter Run</span></div>
+    </section></div>`;
+  }
+  if (state.modal === "tunnels") {
+    const tab = activeTab();
+    const tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId === tab?.id);
+    return `<div class="modal-backdrop"><section class="modal glass-modal tunnels-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">Port forwarding</span><h2>Local tunnels</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">Expose a service reachable by the server on localhost. Use local port 0 to choose a free port automatically.</p>
+      <form id="tunnel-form" class="tunnel-form">
+        ${field("Local port", "localPort", "0", "number", "0")}
+        ${field("Remote host", "remoteHost", "127.0.0.1", "text", "127.0.0.1")}
+        ${field("Remote port", "remotePort", "5432", "number", "5432")}
+        <button class="primary">Start tunnel</button>
+      </form>
+      <div class="tunnel-list">${tunnels.map((tunnel) => `<div class="tunnel-row">
+        <i></i><span><strong>${escapeHtml(tunnel.local)}</strong><small>→ ${escapeHtml(tunnel.remoteHost)}:${tunnel.remotePort}</small></span>
+        <button type="button" data-stop-tunnel="${tunnel.id}">Stop</button>
+      </div>`).join("") || `<div class="files-empty tunnel-empty">No active tunnels for this tab.</div>`}</div>
+      <div class="modal-actions"><span class="modal-note-inline">Tunnels close automatically when this terminal disconnects.</span><button type="button" class="ghost modal-close">Close</button></div>
+    </section></div>`;
+  }
+  if (state.modal === "files") {
+    const rows = state.remoteFiles.map((file) => `<button type="button" class="remote-file-row" data-remote-path="${escapeHtml(file.path)}" data-remote-dir="${file.isDir}">
+      <span class="remote-file-icon">${file.isDir ? "⌑" : "·"}</span>
+      <span class="remote-file-name">${escapeHtml(file.name)}</span>
+      <small>${file.isDir ? "Folder" : formatBytes(file.size)}</small>
+      ${file.isDir ? `<span class="remote-file-open">${icons.chevron}</span>` : `<span class="remote-file-download" data-download-path="${escapeHtml(file.path)}">Download</span>`}
+    </button>`).join("");
+    return `<div class="modal-backdrop"><section class="modal glass-modal files-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">Secure file transfer</span><h2>Remote files</h2></div><button type="button" class="modal-close">×</button></div>
+      <div class="files-address">
+        <button type="button" id="remote-parent" aria-label="Parent folder">↑</button>
+        <span>${escapeHtml(state.browsingPath)}</span>
+        <button type="button" id="upload-remote-file">${icons.plus} Upload</button>
+      </div>
+      <div class="remote-file-list">${state.filesLoading ? `<div class="files-empty">Loading…</div>` : rows || `<div class="files-empty">This folder is empty.</div>`}</div>
+      <div class="modal-actions"><span class="modal-note-inline">SFTP uses this tab’s encrypted SSH connection.</span><button type="button" class="ghost modal-close">Close</button></div>
+    </section></div>`;
+  }
   if (state.modal === "ssh-key") {
     const selected = state.config.servers.find((server) => server.id === state.selectedId);
     const generateChecked = state.sshKeys.length === 0 ? "checked" : "";
@@ -363,16 +694,51 @@ function modalMarkup() {
   }
   if (state.modal === "settings") {
     const p = state.config.preferences;
-    return `<div class="modal-backdrop"><form class="modal glass-modal" id="settings-form">
+    return `<div class="modal-backdrop"><form class="modal glass-modal settings-modal" id="settings-form">
       <div class="modal-handle"></div>
-      <div class="modal-header"><div><span class="eyebrow">Workspace</span><h2>Preferences</h2></div><button type="button" class="modal-close">×</button></div>
-      <div class="form-grid">
-        ${field("Default user", "defaultUser", p.defaultUser)}
-        ${field("Default port", "defaultPort", String(p.defaultPort), "number")}
-        ${field("Default shell", "defaultShell", p.defaultShell)}
-        ${field("Default identity", "defaultIdentity", p.defaultIdentity ?? "")}
-        ${field("Scrollback lines", "scrollback", String(p.scrollback), "number")}
-        <label class="switch-row"><span><strong>Activity logs</strong><small>Stored locally and streamed directly to disk</small></span><input name="logActivity" type="checkbox" ${p.logActivity ? "checked" : ""}><i></i></label>
+      <div class="modal-header"><div><span class="eyebrow">Application</span><h2>Settings</h2></div><button type="button" class="modal-close">×</button></div>
+      <div class="settings-content">
+        <section class="settings-section appearance-settings">
+          <div class="settings-section-title"><strong>Appearance</strong><small>Theme and interface sizing apply immediately</small></div>
+          <div class="theme-picker">
+            ${themeChoice("glass", "Glass", "Transparent acrylic", p.theme)}
+            ${themeChoice("light", "Light", "Clean and bright", p.theme)}
+            ${themeChoice("black", "Black", "High contrast dark", p.theme)}
+          </div>
+          ${rangeControl("Interface scale", "uiScale", p.uiScale, 80, 140, 5, "%")}
+        </section>
+        <div class="settings-columns">
+          <section class="settings-section">
+            <div class="settings-section-title"><strong>Terminal</strong><small>Text rendering and scrollback</small></div>
+            ${rangeControl("Font size", "terminalFontSize", p.terminalFontSize, 10, 28, 1, " px")}
+            ${rangeControl("Line spacing", "terminalLineHeight", p.terminalLineHeight, 100, 200, 5, "%")}
+            <label class="form-field"><span>Font family</span><select name="terminalFontFamily">
+              <option value="system-mono" ${p.terminalFontFamily === "system-mono" ? "selected" : ""}>System monospace</option>
+              <option value="cascadia" ${p.terminalFontFamily === "cascadia" ? "selected" : ""}>Cascadia Mono</option>
+              <option value="jetbrains" ${p.terminalFontFamily === "jetbrains" ? "selected" : ""}>JetBrains Mono</option>
+              <option value="source-code" ${p.terminalFontFamily === "source-code" ? "selected" : ""}>Source Code Pro</option>
+            </select></label>
+            ${field("Scrollback lines", "scrollback", String(p.scrollback), "number")}
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-title"><strong>Connection defaults</strong><small>Used when adding servers</small></div>
+            ${field("Default user", "defaultUser", p.defaultUser)}
+            ${field("Default port", "defaultPort", String(p.defaultPort), "number")}
+            ${field("Default shell", "defaultShell", p.defaultShell)}
+            ${field("Default identity", "defaultIdentity", p.defaultIdentity ?? "", "text", "~/.ssh/id_ed25519", false)}
+            <label class="switch-row auto-connect-setting"><span><strong>Auto-connect new tabs</strong><small>Use agent, key, or saved credential immediately</small></span><input name="autoConnectTabs" type="checkbox" ${p.autoConnectTabs ? "checked" : ""}><i></i></label>
+            <label class="switch-row auto-connect-setting"><span><strong>Reopen active session</strong><small>Reconnect the active terminal when SSHKing starts</small></span><input name="reopenActiveSession" type="checkbox" ${p.reopenActiveSession ? "checked" : ""}><i></i></label>
+          </section>
+        </div>
+        <section class="settings-section privacy-settings">
+          <div class="settings-section-title"><strong>Privacy and history</strong><small>Activity never leaves this device</small></div>
+          <label class="switch-row"><span><strong>Activity logs</strong><small>Store connection events and palette commands locally</small></span><input name="logActivity" type="checkbox" ${p.logActivity ? "checked" : ""}><i></i></label>
+          <label class="switch-row"><span><strong>Save terminal history</strong><small>Replay terminal commands and output when a tab reopens</small></span><input name="persistTerminalHistory" type="checkbox" ${p.persistTerminalHistory ? "checked" : ""}><i></i></label>
+          <div class="history-actions">
+            <button type="button" class="history-button" id="open-activity">${icons.search}<span><strong>View activity history</strong><small>Inspect recent connections and commands</small></span>${icons.chevron}</button>
+            <button type="button" class="history-button" id="clear-terminal-history">${icons.trash}<span><strong>Clear saved terminal history</strong><small>Remove locally stored terminal transcripts</small></span>${icons.chevron}</button>
+          </div>
+        </section>
       </div>
       <div class="modal-actions"><button type="button" class="ghost modal-close">Cancel</button><button class="primary">Save preferences</button></div>
     </form></div>`;
@@ -385,12 +751,26 @@ function modalMarkup() {
     <input type="hidden" name="id" value="${escapeHtml(existing?.id ?? "")}">
     <div class="form-grid two">
       ${field("Display name", "name", existing?.name ?? "", "text", "Production")}
+      ${field("Group (optional)", "group", existing?.group ?? "", "text", "Work, Personal, Clients", false)}
       ${field("Host", "host", existing?.host ?? "", "text", "server.example.com")}
       ${field("User", "user", existing?.user ?? p.defaultUser)}
       ${field("Port", "port", String(existing?.port ?? p.defaultPort), "number")}
       ${field("Remote shell", "shell", existing?.shell ?? p.defaultShell, "text", "default, zsh, bash, fish")}
+      ${field("tmux session prefix", "tmuxSession", existing?.tmuxSession ?? "sshking", "text", "sshking", false)}
       ${field("Private key (optional)", "identity", existing?.identity ?? p.defaultIdentity ?? "", "text", "~/.ssh/id_ed25519", false)}
+      <label class="form-field"><span>Jump host (optional)</span><select name="jumpServerId">
+        <option value="">Direct connection</option>
+        ${state.config.servers.filter((server) => server.id !== existing?.id).map((server) => `<option value="${escapeHtml(server.id)}" ${server.id === existing?.jumpServerId ? "selected" : ""}>${escapeHtml(server.name)} · ${escapeHtml(server.user)}@${escapeHtml(server.host)}</option>`).join("")}
+      </select></label>
       <div class="full">${field("Pinned fingerprint (optional)", "fingerprint", existing?.fingerprint ?? "", "text", "SHA256:…", false)}</div>
+      <label class="switch-row full">
+        <span><strong>Pin this server</strong><small>Keep it at the top of the server list</small></span>
+        <input name="favorite" type="checkbox" ${existing?.favorite ? "checked" : ""}><i></i>
+      </label>
+      <label class="switch-row full">
+        <span><strong>Persistent tmux session</strong><small>Keep programs running and reattach after reconnecting</small></span>
+        <input name="useTmux" type="checkbox" ${existing ? (existing.useTmux ? "checked" : "") : "checked"}><i></i>
+      </label>
     </div>
     <div class="modal-actions">
       ${existing ? `<button type="button" class="danger" id="delete-server">${icons.trash} Delete</button>` : "<span></span>"}
@@ -412,19 +792,51 @@ function bindEvents() {
   });
   document.querySelectorAll<HTMLButtonElement>("[data-server]").forEach((button) => button.onclick = () => {
     state.selectedId = button.dataset.server ?? "";
-    state.output = [{ kind: "system", text: "SSHKing secure terminal · session ready" }, { kind: "muted", text: "Press Connect to open this server." }];
-    resetTerminal();
+    const tab = activeTab();
+    if (tab && tab.connection === "idle") {
+      if (tab.serverId !== state.selectedId) {
+        void backend("ClearSessionTranscript", tab.id);
+        tab.restoredTranscript = "";
+      }
+      tab.serverId = state.selectedId;
+      if (!tab.manualTitle) tab.title = state.config.servers.find((server) => server.id === tab.serverId)?.name ?? "Terminal";
+      resetTerminal(tab);
+    }
     render();
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => button.onclick = (event) => {
+    if ((event.target as HTMLElement).closest("[data-close-tab]")) return;
+    selectTab(button.dataset.tab ?? "");
+  });
+  document.querySelectorAll<HTMLElement>("[data-tab-title]").forEach((title) => title.onclick = (event) => {
+    event.stopPropagation();
+    const tabId = title.dataset.tabTitle ?? "";
+    if (state.activeTabId !== tabId) {
+      selectTab(tabId);
+      return;
+    }
+    openTabRename(tabId);
+  });
+  document.querySelectorAll<HTMLElement>("[data-close-tab]").forEach((button) => button.onclick = (event) => {
+    event.stopPropagation();
+    void closeTerminalTab(button.dataset.closeTab ?? "");
+  });
+  document.querySelector("#new-terminal-tab")?.addEventListener("click", () => addTerminalTab());
+  document.querySelector("#toggle-split")?.addEventListener("click", toggleSplitPane);
   const search = document.querySelector<HTMLInputElement>("#server-search");
   search?.addEventListener("input", () => { state.query = search.value; render(); });
   document.querySelector("#add-server")?.addEventListener("click", () => openModal("server"));
+  document.querySelector("#import-ssh-config")?.addEventListener("click", importSSHConfig);
   document.querySelector("#open-settings")?.addEventListener("click", () => openModal("settings"));
+  document.querySelector("#open-activity")?.addEventListener("click", openActivity);
+  document.querySelector("#clear-terminal-history")?.addEventListener("click", clearTerminalHistory);
   document.querySelector("#edit-server")?.addEventListener("click", () => {
     state.editingId = state.selectedId;
     openModal("server");
   });
   document.querySelector("#setup-key")?.addEventListener("click", openSSHKeyModal);
+  document.querySelector("#open-files")?.addEventListener("click", openRemoteFiles);
+  document.querySelector("#open-tunnels")?.addEventListener("click", () => { state.modal = "tunnels"; render(); });
   document.querySelector("#open-zed-direct")?.addEventListener("click", openCurrentFolderInZed);
   document.querySelector("#open-zed-options")?.addEventListener("click", () => {
     state.modal = "zed";
@@ -435,10 +847,44 @@ function bindEvents() {
   document.querySelector("#connect-button")?.addEventListener("click", toggleConnection);
   document.querySelector<HTMLFormElement>("#server-form")?.addEventListener("submit", saveServer);
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", saveSettings);
+  const settingsForm = document.querySelector<HTMLFormElement>("#settings-form");
+  settingsForm?.addEventListener("input", () => previewSettings(settingsForm));
+  settingsForm?.addEventListener("change", () => previewSettings(settingsForm));
   document.querySelector<HTMLFormElement>("#connect-form")?.addEventListener("submit", connectWithCredentials);
   document.querySelector("#trust-host-key")?.addEventListener("click", trustHostKey);
   document.querySelector<HTMLFormElement>("#zed-form")?.addEventListener("submit", openInZed);
   document.querySelector<HTMLFormElement>("#ssh-key-form")?.addEventListener("submit", installSSHKey);
+  document.querySelector<HTMLFormElement>("#tunnel-form")?.addEventListener("submit", startLocalTunnel);
+  document.querySelectorAll<HTMLElement>("[data-stop-tunnel]").forEach((button) => button.addEventListener("click", () => void stopTunnel(button.dataset.stopTunnel ?? "")));
+  const paletteInput = document.querySelector<HTMLInputElement>("#palette-input");
+  paletteInput?.addEventListener("input", () => filterPalette(paletteInput.value));
+  paletteInput?.addEventListener("keydown", handlePaletteKeydown);
+  document.querySelectorAll<HTMLElement>("[data-palette-action]").forEach((button) => button.addEventListener("click", () => void runPaletteAction(button.dataset.paletteAction ?? "")));
+  const terminalSearchInput = document.querySelector<HTMLInputElement>("#terminal-search-input");
+  terminalSearchInput?.addEventListener("input", () => {
+    state.terminalSearchQuery = terminalSearchInput.value;
+    activeTab()?.searchAddon?.findNext(terminalSearchInput.value, { incremental: true });
+  });
+  terminalSearchInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      (event.shiftKey ? activeTab()?.searchAddon?.findPrevious(state.terminalSearchQuery) : activeTab()?.searchAddon?.findNext(state.terminalSearchQuery));
+    }
+  });
+  document.querySelector("#terminal-search-previous")?.addEventListener("click", () => activeTab()?.searchAddon?.findPrevious(state.terminalSearchQuery));
+  document.querySelector("#terminal-search-next")?.addEventListener("click", () => activeTab()?.searchAddon?.findNext(state.terminalSearchQuery));
+  document.querySelector("#add-terminal-bookmark")?.addEventListener("click", addTerminalBookmark);
+  document.querySelector("#close-terminal-search")?.addEventListener("click", closeTerminalSearch);
+  document.querySelectorAll<HTMLElement>("[data-terminal-bookmark]").forEach((button) => button.addEventListener("click", () => activeTab()?.terminal?.scrollToLine(Number(button.dataset.terminalBookmark))));
+  document.querySelector("#remote-parent")?.addEventListener("click", () => void browseRemote(parentRemotePath(state.browsingPath)));
+  document.querySelector("#upload-remote-file")?.addEventListener("click", uploadRemoteFile);
+  document.querySelectorAll<HTMLElement>("[data-remote-path]").forEach((row) => row.addEventListener("dblclick", () => {
+    if (row.dataset.remoteDir === "true") void browseRemote(row.dataset.remotePath ?? "~");
+  }));
+  document.querySelectorAll<HTMLElement>("[data-download-path]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void downloadRemoteFile(button.dataset.downloadPath ?? "");
+  }));
   const rememberPassword = document.querySelector<HTMLInputElement>('input[name="rememberPassword"]');
   const requireBiometric = document.querySelector<HTMLInputElement>('input[name="requireBiometric"]');
   rememberPassword?.addEventListener("change", () => {
@@ -449,6 +895,94 @@ function bindEvents() {
   document.querySelector("#delete-server")?.addEventListener("click", deleteServer);
 }
 
+function themeChoice(value: Preferences["theme"], label: string, description: string, selected: Preferences["theme"]) {
+  return `<label class="theme-choice ${value}">
+    <input type="radio" name="theme" value="${value}" ${selected === value ? "checked" : ""}>
+    <span class="theme-preview"><i></i><b></b></span>
+    <span><strong>${label}</strong><small>${description}</small></span>
+  </label>`;
+}
+
+function rangeControl(label: string, name: string, value: number, min: number, max: number, step: number, suffix: string) {
+  return `<label class="range-control">
+    <span><strong>${label}</strong><output data-range-output="${name}">${value}${suffix}</output></span>
+    <input type="range" name="${name}" value="${value}" min="${min}" max="${max}" step="${step}" data-suffix="${escapeHtml(suffix)}">
+  </label>`;
+}
+
+function paletteActions() {
+  const modifier = state.platform === "darwin" ? "⌘" : "Ctrl";
+  return [
+    { id: "new-tab", label: "New terminal", detail: "Open another terminal tab", shortcut: `${modifier} T`, icon: icons.plus },
+    { id: "split", label: "Toggle split terminal", detail: "View two sessions side by side", shortcut: `${modifier} \\`, icon: "▥" },
+    { id: "connect", label: activeTab()?.connection === "connected" ? "Disconnect active server" : "Connect active server", detail: activeTab()?.title ?? "Terminal", shortcut: "", icon: icons.terminal },
+    { id: "files", label: "Browse remote files", detail: "Open secure SFTP browser", shortcut: "", icon: icons.server },
+    { id: "tunnels", label: "Manage local tunnels", detail: "Forward a local port over SSH", shortcut: "", icon: icons.arrow },
+    { id: "zed", label: "Open current folder in Zed", detail: currentRemotePath(), shortcut: "", icon: icons.code },
+    { id: "import", label: "Import SSH config", detail: "Add hosts from ~/.ssh/config", shortcut: "", icon: "⇩" },
+    { id: "settings", label: "Open preferences", detail: "Terminal, shell, and privacy defaults", shortcut: state.platform === "darwin" ? "⌘ ," : "", icon: icons.settings },
+    { id: "cmd:pwd", label: "Run: pwd", detail: "Print the current remote directory", shortcut: "", icon: "›" },
+    { id: "cmd:ls -la", label: "Run: ls -la", detail: "List all files with details", shortcut: "", icon: "›" },
+    { id: "cmd:git status", label: "Run: git status", detail: "Show repository status", shortcut: "", icon: "›" },
+    { id: "cmd:df -h", label: "Run: df -h", detail: "Show remote disk usage", shortcut: "", icon: "›" },
+  ];
+}
+
+function filterPalette(query: string) {
+  state.paletteQuery = query;
+  const normalized = query.trim().toLowerCase();
+  document.querySelectorAll<HTMLElement>("[data-palette-search]").forEach((row) => {
+    row.hidden = Boolean(normalized) && !row.dataset.paletteSearch?.includes(normalized);
+  });
+}
+
+function handlePaletteKeydown(event: KeyboardEvent) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  const query = (event.currentTarget as HTMLInputElement).value.trim();
+  const first = document.querySelector<HTMLElement>("[data-palette-action]:not([hidden])");
+  if (!query && first) {
+    void runPaletteAction(first.dataset.paletteAction ?? "");
+  } else if (query) {
+    const exact = paletteActions().find((action) => action.label.toLowerCase() === query.toLowerCase());
+    void (exact ? runPaletteAction(exact.id) : runTerminalCommand(query));
+  }
+}
+
+async function runPaletteAction(action: string) {
+  state.modal = "";
+  state.paletteQuery = "";
+  if (action === "new-tab") return addTerminalTab();
+  if (action === "split") return toggleSplitPane();
+  if (action === "connect") return toggleConnection();
+  if (action === "files") return openRemoteFiles();
+  if (action === "tunnels") { state.modal = "tunnels"; return render(); }
+  if (action === "zed") return openCurrentFolderInZed();
+  if (action === "import") return importSSHConfig();
+  if (action === "settings") return openModal("settings");
+  if (action.startsWith("cmd:")) return runTerminalCommand(action.slice(4));
+  render();
+}
+
+async function runTerminalCommand(command: string) {
+  const tab = activeTab();
+  state.modal = "";
+  state.paletteQuery = "";
+  if (!tab || tab.connection !== "connected") {
+    pushOutput(tab, { kind: "error", text: "Connect this terminal before running a command." });
+    render();
+    return;
+  }
+  try {
+    await backend("SendCommand", tab.id, command);
+    recordObservedCommand(tab, command);
+  } catch (error) {
+    pushOutput(tab, { kind: "error", text: `Command failed: ${String(error)}` });
+  }
+  render();
+  requestAnimationFrame(() => tab.terminal?.focus());
+}
+
 function openModal(type: "server" | "settings") {
   if (type === "server" && !state.editingId) state.editingId = "";
   state.modal = type;
@@ -457,6 +991,7 @@ function openModal(type: "server" | "settings") {
 }
 
 function closeModal() {
+  if (state.modal === "settings") applyAppearance(state.config.preferences);
   if (state.modal === "trust-host-key") {
     state.pendingConnection = null;
     state.pendingHostFingerprint = "";
@@ -473,18 +1008,31 @@ async function saveServer(event: SubmitEvent) {
   const server: Server = {
     id: String(form.get("id") ?? ""),
     name: String(form.get("name") ?? ""),
+    group: String(form.get("group") ?? ""),
     host: String(form.get("host") ?? ""),
     user: String(form.get("user") ?? ""),
     port: Number(form.get("port") ?? 22),
     shell: String(form.get("shell") ?? "default"),
+    useTmux: form.get("useTmux") === "on",
+    tmuxSession: String(form.get("tmuxSession") ?? "sshking"),
     identity: String(form.get("identity") ?? ""),
+    jumpServerId: String(form.get("jumpServerId") ?? ""),
     fingerprint: String(form.get("fingerprint") ?? ""),
-    favorite: existing?.favorite ?? false,
+    favorite: form.get("favorite") === "on",
     passwordSaved: existing?.passwordSaved ?? false,
     requireBiometric: existing?.requireBiometric ?? false,
   };
   state.config = await backend("SaveServer", server);
   state.selectedId = server.id || state.config.servers.at(-1)?.id || "";
+  const tab = activeTab();
+  if (tab && tab.connection === "idle") {
+    if (tab.serverId !== state.selectedId) {
+      void backend("ClearSessionTranscript", tab.id);
+      tab.restoredTranscript = "";
+    }
+    tab.serverId = state.selectedId;
+    if (!tab.manualTitle) tab.title = state.config.servers.find((item) => item.id === tab.serverId)?.name ?? "Terminal";
+  }
   closeModal();
 }
 
@@ -498,23 +1046,130 @@ async function saveSettings(event: SubmitEvent) {
     defaultIdentity: String(form.get("defaultIdentity") ?? ""),
     scrollback: Number(form.get("scrollback") ?? 2000),
     logActivity: form.get("logActivity") === "on",
+    persistTerminalHistory: form.get("persistTerminalHistory") === "on",
+    theme: String(form.get("theme") ?? "glass") as Preferences["theme"],
+    uiScale: Number(form.get("uiScale") ?? 100),
+    terminalFontSize: Number(form.get("terminalFontSize") ?? 14),
+    terminalFontFamily: String(form.get("terminalFontFamily") ?? "system-mono") as Preferences["terminalFontFamily"],
+    terminalLineHeight: Number(form.get("terminalLineHeight") ?? 140),
+    autoConnectTabs: form.get("autoConnectTabs") === "on",
+    reopenActiveSession: form.get("reopenActiveSession") === "on",
   };
   state.config = await backend("SavePreferences", preferences);
+  applyAppearance(state.config.preferences);
   closeModal();
+}
+
+function previewSettings(form: HTMLFormElement) {
+  const data = new FormData(form);
+  const preview: Preferences = {
+    ...state.config.preferences,
+    theme: String(data.get("theme") ?? state.config.preferences.theme) as Preferences["theme"],
+    uiScale: Number(data.get("uiScale") ?? state.config.preferences.uiScale),
+    terminalFontSize: Number(data.get("terminalFontSize") ?? state.config.preferences.terminalFontSize),
+    terminalFontFamily: String(data.get("terminalFontFamily") ?? state.config.preferences.terminalFontFamily) as Preferences["terminalFontFamily"],
+    terminalLineHeight: Number(data.get("terminalLineHeight") ?? state.config.preferences.terminalLineHeight),
+  };
+  form.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((input) => {
+    const output = form.querySelector<HTMLOutputElement>(`[data-range-output="${input.name}"]`);
+    if (output) output.value = `${input.value}${input.dataset.suffix ?? ""}`;
+  });
+  applyAppearance(preview);
+}
+
+function applyAppearance(preferences: Preferences) {
+  const shell = document.querySelector<HTMLElement>(".window-shell");
+  if (shell) {
+    shell.classList.remove("theme-light", "theme-black", "theme-glass");
+    shell.classList.add(`theme-${preferences.theme}`);
+    shell.style.setProperty("--ui-scale", String(preferences.uiScale / 100));
+  }
+  for (const tab of state.tabs) {
+    if (!tab.terminal) continue;
+    tab.terminal.options.fontSize = preferences.terminalFontSize;
+    tab.terminal.options.fontFamily = terminalFontFamily(preferences.terminalFontFamily);
+    tab.terminal.options.lineHeight = preferences.terminalLineHeight / 100;
+    tab.terminal.options.theme = terminalTheme(preferences.theme);
+  }
+  requestAnimationFrame(fitVisibleTerminals);
+}
+
+async function openActivity() {
+  try {
+    state.activity = await backend("GetActivity", 300);
+  } catch (error) {
+    state.activity = [`Could not load activity: ${String(error)}`];
+  }
+  state.modal = "activity";
+  render();
+}
+
+async function clearTerminalHistory() {
+  try {
+    await backend("ClearTerminalHistory");
+    for (const tab of state.tabs) tab.restoredTranscript = "";
+    state.modal = "";
+    pushOutput(activeTab(), { kind: "success", text: "Saved terminal history cleared." });
+    render();
+  } catch (error) {
+    pushOutput(activeTab(), { kind: "error", text: `Could not clear terminal history: ${String(error)}` });
+  }
+}
+
+async function importSSHConfig() {
+  const before = state.config.servers.length;
+  try {
+    state.config = await backend("ImportSSHConfig", "");
+    const added = state.config.servers.length - before;
+    if (!state.selectedId && state.config.servers[0]) {
+      state.selectedId = state.config.servers[0].id;
+      const tab = activeTab();
+      if (tab) {
+        tab.serverId = state.selectedId;
+        tab.title = state.config.servers[0].name;
+      }
+    }
+    pushOutput(activeTab(), {
+      kind: added ? "success" : "muted",
+      text: added ? `Imported ${added} server${added === 1 ? "" : "s"} from ~/.ssh/config` : "No new SSH hosts found to import.",
+    });
+  } catch (error) {
+    pushOutput(activeTab(), { kind: "error", text: `Could not import ~/.ssh/config: ${String(error)}` });
+  }
+  render();
 }
 
 async function deleteServer() {
   if (!state.editingId) return;
-  state.config = await backend("DeleteServer", state.editingId);
+  const deletedId = state.editingId;
+  state.config = await backend("DeleteServer", deletedId);
+  for (const tab of state.tabs.filter((item) => item.serverId === deletedId)) {
+    await backend("ClearSessionTranscript", tab.id).catch(() => undefined);
+    window.clearTimeout(tab.reconnectTimer);
+    tab.terminal?.dispose();
+  }
+  state.tabs = state.tabs.filter((item) => item.serverId !== deletedId);
   state.selectedId = state.config.servers[0]?.id ?? "";
+  if (!state.tabs.length) state.tabs.push(newTerminalTab(state.selectedId));
+  const next = state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0];
+  state.activeTabId = next.id;
+  state.selectedId = next.serverId;
+  if (!state.tabs.some((tab) => tab.id === state.splitTabId)) state.splitTabId = "";
   closeModal();
 }
 
 async function toggleConnection() {
-  if (state.connection === "connected") {
-    await backend("Disconnect");
-    state.connection = "idle";
-    pushOutput({ kind: "muted", text: "Session disconnected." });
+  const tab = activeTab();
+  if (!tab) return;
+  if (tab.connection === "connected") {
+    tab.restoreSession = false;
+    tab.lastRequest = undefined;
+    window.clearTimeout(tab.reconnectTimer);
+    tab.reconnectTimer = undefined;
+    await backend("Disconnect", tab.id);
+    tab.connection = "idle";
+    state.tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId !== tab.id);
+    pushOutput(tab, { kind: "muted", text: "Session disconnected." });
     render();
     return;
   }
@@ -526,6 +1181,7 @@ async function connectWithCredentials(event: SubmitEvent) {
   event.preventDefault();
   const form = new FormData(event.currentTarget as HTMLFormElement);
   await attemptConnection({
+    tabId: activeTab()?.id ?? "",
     password: String(form.get("password") ?? ""),
     rememberPassword: form.get("rememberPassword") === "on",
     requireBiometric: form.get("requireBiometric") === "on",
@@ -544,23 +1200,36 @@ async function trustHostKey() {
 }
 
 async function attemptConnection(request: ConnectionRequest, trustNewHost: boolean) {
+  const tab = state.tabs.find((item) => item.id === request.tabId);
+  if (!tab) return;
   state.modal = "";
-  state.connection = "connecting";
-  pushOutput({ kind: "system", text: `Opening secure session…` });
+  tab.connection = "connecting";
+  pushOutput(tab, { kind: "system", text: `Opening secure session…` });
   render();
   try {
-    await backend("Connect", state.selectedId, request.password, request.rememberPassword, request.requireBiometric, trustNewHost);
+    await backend("Connect", tab.id, tab.serverId, request.password, request.rememberPassword, request.requireBiometric, trustNewHost);
     const refreshed = await backend("GetState");
     if (refreshed?.config) state.config = refreshed.config;
     state.pendingConnection = null;
     state.pendingHostFingerprint = "";
-    state.connection = "connected";
-    pushOutput({ kind: "success", text: "Connected · remote shell is ready" });
-    fitTerminal();
-    await backend("ResizeTerminal", terminal?.cols ?? 120, terminal?.rows ?? 34);
+    tab.connection = "connected";
+    tab.restoreSession = true;
+    const server = state.config.servers.find((item) => item.id === tab.serverId);
+    tab.lastRequest = (!request.password || request.rememberPassword || Boolean(server?.identity))
+      ? { ...request, password: "" }
+      : undefined;
+    tab.reconnectAttempts = 0;
+    pushOutput(tab, {
+      kind: "success",
+      text: server?.useTmux
+        ? "Connected · persistent tmux session attached for this tab"
+        : "Connected · remote shell is ready",
+    });
+    fitTerminal(tab);
+    await backend("ResizeTerminal", tab.id, tab.terminal?.cols ?? 120, tab.terminal?.rows ?? 34);
     if (!window.go) {
-      pushOutput({ kind: "output", text: "Last login: Today from 192.168.1.8" });
-      pushOutput({ kind: "output", text: "Welcome to Northstar Linux 24.04 LTS" });
+      pushOutput(tab, { kind: "output", text: "Last login: Today from 192.168.1.8" });
+      pushOutput(tab, { kind: "output", text: "Welcome to Northstar Linux 24.04 LTS" });
     }
   } catch (error) {
     const message = String(error);
@@ -568,21 +1237,25 @@ async function attemptConnection(request: ConnectionRequest, trustNewHost: boole
       ? message.match(/SHA256:[A-Za-z0-9+/=]+/)?.[0]
       : undefined;
     if (fingerprint && !trustNewHost) {
-      state.connection = "idle";
+      tab.connection = "idle";
       state.pendingConnection = request;
       state.pendingHostFingerprint = fingerprint;
       state.modal = "trust-host-key";
       render();
       return;
     }
-    state.connection = "error";
-    pushOutput({ kind: "error", text: message });
+    tab.connection = "error";
+    pushOutput(tab, { kind: "error", text: message });
+    if (tab.lastRequest && tab.reconnectAttempts > 0) {
+      tab.connection = "idle";
+      scheduleReconnect(tab);
+    }
   }
   render();
-  if (state.connection === "connected") {
+  if (tab.connection === "connected") {
     requestAnimationFrame(() => {
-      fitTerminal();
-      terminal?.focus();
+      fitTerminal(tab);
+      if (tab.id === state.activeTabId) tab.terminal?.focus();
     });
   }
 }
@@ -596,10 +1269,10 @@ async function openInZed(event: SubmitEvent) {
   try {
     await backend("OpenInZed", state.selectedId, remotePath, newWindow, passSavedPassword);
     state.modal = "";
-    pushOutput({ kind: "success", text: `Opening ${remotePath} in Zed…` });
+    pushOutput(activeTab(), { kind: "success", text: `Opening ${remotePath} in Zed…` });
   } catch (error) {
     state.modal = "";
-    pushOutput({ kind: "error", text: `Could not open Zed: ${String(error)}` });
+    pushOutput(activeTab(), { kind: "error", text: `Could not open Zed: ${String(error)}` });
   }
   render();
 }
@@ -608,9 +1281,101 @@ async function openCurrentFolderInZed() {
   const remotePath = currentRemotePath();
   try {
     await backend("OpenInZed", state.selectedId, remotePath, true, false);
-    pushOutput({ kind: "success", text: `Opening ${remotePath} in Zed…` });
+    pushOutput(activeTab(), { kind: "success", text: `Opening ${remotePath} in Zed…` });
   } catch (error) {
-    pushOutput({ kind: "error", text: `Could not open Zed: ${String(error)}` });
+    pushOutput(activeTab(), { kind: "error", text: `Could not open Zed: ${String(error)}` });
+  }
+  render();
+}
+
+async function openRemoteFiles() {
+  const tab = activeTab();
+  if (!tab || tab.connection !== "connected") {
+    pushOutput(tab, { kind: "error", text: "Connect this terminal before browsing remote files." });
+    state.modal = "";
+    render();
+    return;
+  }
+  state.browsingPath = tab.remotePath || "~";
+  state.remoteFiles = [];
+  state.modal = "files";
+  render();
+  await browseRemote(state.browsingPath);
+}
+
+async function browseRemote(remotePath: string) {
+  const tab = activeTab();
+  if (!tab) return;
+  state.filesLoading = true;
+  state.browsingPath = remotePath;
+  render();
+  try {
+    state.remoteFiles = await backend("ListRemoteFiles", tab.id, remotePath);
+  } catch (error) {
+    state.remoteFiles = [];
+    pushOutput(tab, { kind: "error", text: `Could not browse ${remotePath}: ${String(error)}` });
+  } finally {
+    state.filesLoading = false;
+    render();
+  }
+}
+
+async function downloadRemoteFile(remotePath: string) {
+  const tab = activeTab();
+  if (!tab || !remotePath) return;
+  try {
+    const destination = await backend("DownloadRemoteFile", tab.id, remotePath);
+    if (destination) pushOutput(tab, { kind: "success", text: `Downloaded ${remotePath} to ${destination}` });
+  } catch (error) {
+    pushOutput(tab, { kind: "error", text: `Download failed: ${String(error)}` });
+  }
+  render();
+}
+
+async function uploadRemoteFile() {
+  const tab = activeTab();
+  if (!tab) return;
+  try {
+    const uploaded = await backend("UploadRemoteFile", tab.id, state.browsingPath);
+    if (uploaded) {
+      pushOutput(tab, { kind: "success", text: `Uploaded ${uploaded}` });
+      await browseRemote(state.browsingPath);
+    }
+  } catch (error) {
+    pushOutput(tab, { kind: "error", text: `Upload failed: ${String(error)}` });
+    render();
+  }
+}
+
+async function startLocalTunnel(event: SubmitEvent) {
+  event.preventDefault();
+  const tab = activeTab();
+  if (!tab) return;
+  const form = new FormData(event.currentTarget as HTMLFormElement);
+  try {
+    const tunnel = await backend(
+      "StartLocalTunnel",
+      tab.id,
+      Number(form.get("localPort") ?? 0),
+      String(form.get("remoteHost") ?? "127.0.0.1"),
+      Number(form.get("remotePort") ?? 0),
+    ) as TunnelInfo;
+    state.tunnels.push(tunnel);
+    pushOutput(tab, { kind: "success", text: `Tunnel ready · ${tunnel.local} → ${tunnel.remoteHost}:${tunnel.remotePort}` });
+  } catch (error) {
+    pushOutput(tab, { kind: "error", text: `Could not start tunnel: ${String(error)}` });
+  }
+  render();
+}
+
+async function stopTunnel(id: string) {
+  const tunnel = state.tunnels.find((item) => item.id === id);
+  try {
+    await backend("StopTunnel", id);
+    state.tunnels = state.tunnels.filter((item) => item.id !== id);
+    if (tunnel) pushOutput(activeTab(), { kind: "muted", text: `Stopped tunnel on ${tunnel.local}` });
+  } catch (error) {
+    pushOutput(activeTab(), { kind: "error", text: `Could not stop tunnel: ${String(error)}` });
   }
   render();
 }
@@ -621,7 +1386,7 @@ async function openSSHKeyModal() {
     state.modal = "ssh-key";
     render();
   } catch (error) {
-    pushOutput({ kind: "error", text: `Could not list SSH keys: ${String(error)}` });
+    pushOutput(activeTab(), { kind: "error", text: `Could not list SSH keys: ${String(error)}` });
     render();
   }
 }
@@ -635,168 +1400,449 @@ async function installSSHKey(event: SubmitEvent) {
   try {
     state.config = await backend("InstallSSHKey", state.selectedId, generate ? "" : choice, password, generate);
     state.modal = "";
-    pushOutput({ kind: "success", text: "SSH key installed · future connections can use the private key" });
+    pushOutput(activeTab(), { kind: "success", text: "SSH key installed · future connections can use the private key" });
   } catch (error) {
     state.modal = "";
-    pushOutput({ kind: "error", text: `Could not install SSH key: ${String(error)}` });
+    pushOutput(activeTab(), { kind: "error", text: `Could not install SSH key: ${String(error)}` });
   }
   render();
 }
 
 function attachRuntimeEvents() {
-  window.runtime?.EventsOn("terminal:data", (data) => {
-    terminal?.write(String(data));
+  window.runtime?.EventsOn("terminal:data", (payload) => {
+    const event = payload as { sessionId?: string; data?: string };
+    const tab = state.tabs.find((item) => item.id === event.sessionId);
+    if (tab) queueTerminalOutput(tab, String(event.data ?? ""));
   });
   window.runtime?.EventsOn("terminal:status", (payload) => {
-    const event = payload as { state?: ConnectionState | "disconnected"; message?: string };
-    state.connection = event.state === "disconnected" ? "idle" : event.state ?? "idle";
-    if (event.message) pushOutput({ kind: "error", text: event.message });
+    const event = payload as { sessionId?: string; state?: ConnectionState | "disconnected"; message?: string };
+    const tab = state.tabs.find((item) => item.id === event.sessionId);
+    if (!tab) return;
+    tab.connection = event.state === "disconnected" ? "idle" : event.state ?? "idle";
+    if (event.state === "disconnected") state.tunnels = state.tunnels.filter((tunnel) => tunnel.sessionId !== tab.id);
+    if (event.message) pushOutput(tab, { kind: "error", text: event.message });
+    if (event.state === "disconnected" && tab.lastRequest) scheduleReconnect(tab);
     render();
   });
 }
 
-function pushOutput(line: { kind: string; text: string }) {
-  state.output.push(line);
-  const excess = state.output.length - state.config.preferences.scrollback;
-  if (excess > 0) state.output.splice(0, excess);
-  if (!terminal) return;
-  const color = {
-    system: "\x1b[38;2;38;53;91m",
-    muted: "\x1b[38;2;75;83;103m",
-    success: "\x1b[38;2;20;107;80m",
-    error: "\x1b[38;2;165;29;61m",
-  }[line.kind] ?? "\x1b[0m";
-  terminal.writeln(`\r${color}${line.text}\x1b[0m`);
+function queueTerminalOutput(tab: TerminalTab, data: string) {
+  if (!data) return;
+  tab.pendingTerminalData += data;
+  if (tab.terminalWriteScheduled) return;
+  tab.terminalWriteScheduled = true;
+  requestAnimationFrame(() => flushTerminalOutput(tab));
 }
 
-function mountTerminal() {
-  const placeholder = document.querySelector<HTMLDivElement>("#terminal-output");
+function flushTerminalOutput(tab: TerminalTab) {
+  const chunk = tab.pendingTerminalData.slice(0, 65536);
+  tab.pendingTerminalData = tab.pendingTerminalData.slice(chunk.length);
+  if (chunk) tab.terminal?.write(chunk);
+  if (tab.pendingTerminalData) {
+    requestAnimationFrame(() => flushTerminalOutput(tab));
+  } else {
+    tab.terminalWriteScheduled = false;
+  }
+}
+
+function scheduleReconnect(tab: TerminalTab) {
+  if (!tab.restoreSession || tab.reconnectTimer) return;
+  const delay = Math.min(30000, 1000 * 2 ** Math.min(tab.reconnectAttempts, 5));
+  tab.reconnectAttempts++;
+  pushOutput(tab, { kind: "muted", text: `Connection lost · reconnecting in ${delay / 1000}s (attempt ${tab.reconnectAttempts})` });
+  tab.reconnectTimer = window.setTimeout(() => {
+    tab.reconnectTimer = undefined;
+    if (!tab.lastRequest || tab.connection !== "idle") return;
+    void attemptConnection(tab.lastRequest, false);
+  }, delay);
+}
+
+function pushOutput(tab: TerminalTab | undefined, line: OutputLine) {
+  if (!tab) return;
+  tab.output.push(line);
+  const excess = tab.output.length - state.config.preferences.scrollback;
+  if (excess > 0) tab.output.splice(0, excess);
+  writeOutputLine(tab, line);
+}
+
+function writeOutputLine(tab: TerminalTab, line: OutputLine) {
+  if (!tab.terminal) return;
+  const color = { system: "\x1b[94m", muted: "\x1b[90m", success: "\x1b[92m", error: "\x1b[91m" }[line.kind] ?? "\x1b[0m";
+  tab.terminal.writeln(`\r${color}${line.text}\x1b[0m`);
+}
+
+function mountVisibleTerminals() {
+  for (const tab of visibleTabs()) mountTerminal(tab);
+  requestAnimationFrame(() => fitVisibleTerminals());
+}
+
+function mountTerminal(tab: TerminalTab) {
+  const placeholder = document.querySelector<HTMLDivElement>(`[data-terminal-slot="${tab.id}"]`);
   if (!placeholder) return;
 
-  if (terminalHost && terminal) {
-    placeholder.replaceWith(terminalHost);
+  if (tab.host && tab.terminal) {
+    placeholder.replaceWith(tab.host);
   } else {
-    terminalHost = placeholder;
-    terminal = new Terminal({
+    tab.host = placeholder;
+    tab.terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
-      fontFamily: '"Cascadia Mono", "SFMono-Regular", Consolas, monospace',
-      fontSize: 14,
+      fontFamily: terminalFontFamily(state.config.preferences.terminalFontFamily),
+      fontSize: state.config.preferences.terminalFontSize,
       fontWeight: "500",
       fontWeightBold: "700",
-      lineHeight: 1.4,
+      lineHeight: state.config.preferences.terminalLineHeight / 100,
       scrollback: state.config.preferences.scrollback,
       allowTransparency: true,
-      theme: {
-        background: "#00000000",
-        foreground: "#182033",
-        cursor: "#27324d",
-        cursorAccent: "#eef0f7",
-        selectionBackground: "#5366c04a",
-        black: "#101522",
-        red: "#a51d3d",
-        green: "#146b50",
-        yellow: "#795800",
-        blue: "#244f9e",
-        magenta: "#71308f",
-        cyan: "#006579",
-        white: "#343b4d",
-        brightBlack: "#525a6d",
-        brightRed: "#c52e50",
-        brightGreen: "#168061",
-        brightYellow: "#916a00",
-        brightBlue: "#315fba",
-        brightMagenta: "#8b3eaa",
-        brightCyan: "#007d94",
-        brightWhite: "#151b2a",
-      },
+      theme: terminalTheme(state.config.preferences.theme),
     });
-    terminal.parser.registerOscHandler(7, (data) => {
-      recordRemoteDirectory(data);
+    tab.terminal.parser.registerOscHandler(7, (data) => {
+      recordRemoteDirectory(tab, data);
       return true;
     });
-    fitAddon = new FitAddon();
-    terminal.loadAddon(fitAddon);
-    terminal.open(terminalHost);
-    terminal.onData(queueTerminalInput);
-    terminal.onResize(({ cols, rows }) => scheduleTerminalResize(cols, rows));
-    for (const line of state.output) pushOutputWithoutState(line);
+    tab.terminal.attachCustomKeyEventHandler((event) => {
+      const copyShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c";
+      const findShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f";
+      if (event.type === "keydown" && copyShortcut && tab.terminal?.hasSelection()) {
+        void copyTerminalSelection(tab);
+        return false;
+      }
+      if (event.type === "keydown" && findShortcut) {
+        openTerminalSearch();
+        return false;
+      }
+      return true;
+    });
+    tab.fitAddon = new FitAddon();
+    tab.searchAddon = new SearchAddon();
+    tab.terminal.loadAddon(tab.fitAddon);
+    tab.terminal.loadAddon(tab.searchAddon);
+    tab.terminal.open(tab.host);
+    tab.terminal.onData((data) => queueTerminalInput(tab, data));
+    tab.terminal.onResize(({ cols, rows }) => scheduleTerminalResize(tab, cols, rows));
+    if (tab.restoredTranscript) {
+      tab.terminal.write(tab.restoredTranscript);
+      tab.terminal.writeln("\r\n\x1b[90m── Previous session history ──\x1b[0m");
+    }
+    for (const line of tab.output) writeOutputLine(tab, line);
   }
 
-  document.querySelector("#terminal-stage")?.addEventListener("mousedown", () => terminal?.focus());
-  requestAnimationFrame(fitTerminal);
+  const pane = document.querySelector<HTMLElement>(`[data-pane-tab="${tab.id}"]`);
+  pane?.addEventListener("mousedown", () => tab.terminal?.focus());
+  pane?.addEventListener("contextmenu", (event) => {
+    if (!tab.terminal?.hasSelection()) return;
+    event.preventDefault();
+    void copyTerminalSelection(tab);
+  });
 }
 
-function pushOutputWithoutState(line: { kind: string; text: string }) {
-  if (!terminal) return;
-  const color = line.kind === "system" ? "\x1b[38;2;38;53;91m" : "\x1b[38;2;75;83;103m";
-  terminal.writeln(`${color}${line.text}\x1b[0m`);
-}
-
-function queueTerminalInput(data: string) {
-  if (state.connection !== "connected") return;
-  inputQueue += data;
-  void flushTerminalInput();
-}
-
-async function flushTerminalInput() {
-  if (sendingInput) return;
-  sendingInput = true;
+async function copyTerminalSelection(tab: TerminalTab) {
+  const selection = tab.terminal?.getSelection() ?? "";
+  if (!selection) return;
   try {
-    while (inputQueue) {
-      const data = inputQueue;
-      inputQueue = "";
-      await backend("SendInput", data);
+    if (window.runtime?.ClipboardSetText) {
+      await window.runtime.ClipboardSetText(selection);
+    } else if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(selection);
+    } else {
+      const clipboardInput = document.createElement("textarea");
+      clipboardInput.value = selection;
+      clipboardInput.style.position = "fixed";
+      clipboardInput.style.opacity = "0";
+      document.body.appendChild(clipboardInput);
+      clipboardInput.select();
+      document.execCommand("copy");
+      clipboardInput.remove();
+    }
+    showCopyToast();
+  } catch (error) {
+    pushOutput(tab, { kind: "error", text: `Could not copy terminal selection: ${String(error)}` });
+  }
+}
+
+function showCopyToast() {
+  const toast = document.querySelector<HTMLElement>("#terminal-copy-toast");
+  if (!toast) return;
+  toast.classList.add("visible");
+  window.clearTimeout(copyToastTimer);
+  copyToastTimer = window.setTimeout(() => toast.classList.remove("visible"), 1100);
+}
+
+function openTerminalSearch() {
+  state.terminalSearch = true;
+  render();
+  requestAnimationFrame(() => {
+    const input = document.querySelector<HTMLInputElement>("#terminal-search-input");
+    input?.focus();
+    input?.select();
+  });
+}
+
+function closeTerminalSearch() {
+  state.terminalSearch = false;
+  activeTab()?.searchAddon?.clearDecorations();
+  render();
+  requestAnimationFrame(() => activeTab()?.terminal?.focus());
+}
+
+function addTerminalBookmark() {
+  const tab = activeTab();
+  if (!tab?.terminal) return;
+  const line = tab.terminal.buffer.active.viewportY;
+  if (!tab.bookmarks.some((bookmark) => bookmark.line === line)) {
+    tab.bookmarks.push({ id: `${tab.id}-${line}`, label: `#${tab.bookmarks.length + 1}`, line });
+  }
+  render();
+}
+
+function queueTerminalInput(tab: TerminalTab, data: string) {
+  if (tab.connection !== "connected") return;
+  observeCommandInput(tab, data);
+  tab.inputQueue += data;
+  void flushTerminalInput(tab);
+}
+
+function observeCommandInput(tab: TerminalTab, data: string) {
+  const tokens = data.match(/\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1bP[\s\S]*?\x1b\\|\x1b\[[0-?]*[ -/]*[@-~]|\x1bO.|[\s\S]/g) ?? [];
+  for (const token of tokens) {
+    if (token.startsWith("\x1b]") || token.startsWith("\x1bP")) continue;
+    if (token === "\r" || token === "\n") {
+      submitObservedCommand(tab);
+      continue;
+    }
+    if (token === "\x7f" || token === "\b") {
+      if (tab.commandCursor > 0) {
+        tab.commandBuffer = tab.commandBuffer.slice(0, tab.commandCursor - 1) + tab.commandBuffer.slice(tab.commandCursor);
+        tab.commandCursor--;
+      }
+      continue;
+    }
+    if (token === "\x15") {
+      tab.commandBuffer = tab.commandBuffer.slice(tab.commandCursor);
+      tab.commandCursor = 0;
+      continue;
+    }
+    if (token === "\x17") {
+      const before = tab.commandBuffer.slice(0, tab.commandCursor).replace(/\s*\S+\s*$/, "");
+      tab.commandBuffer = before + tab.commandBuffer.slice(tab.commandCursor);
+      tab.commandCursor = before.length;
+      continue;
+    }
+    if (token === "\x0b") {
+      tab.commandBuffer = tab.commandBuffer.slice(0, tab.commandCursor);
+      continue;
+    }
+    if (token === "\x03") {
+      resetObservedCommand(tab);
+      continue;
+    }
+    if (token === "\x01") { tab.commandCursor = 0; continue; }
+    if (token === "\x05") { tab.commandCursor = tab.commandBuffer.length; continue; }
+    if ((token === "\x1b[D" || token === "\x1bOD") && tab.commandCursor > 0) { tab.commandCursor--; continue; }
+    if ((token === "\x1b[C" || token === "\x1bOC") && tab.commandCursor < tab.commandBuffer.length) { tab.commandCursor++; continue; }
+    if (token === "\x1b[H" || token === "\x1b[1~" || token === "\x1bOH") { tab.commandCursor = 0; continue; }
+    if (token === "\x1b[F" || token === "\x1b[4~" || token === "\x1bOF") { tab.commandCursor = tab.commandBuffer.length; continue; }
+    if (token === "\x1b[3~") {
+      tab.commandBuffer = tab.commandBuffer.slice(0, tab.commandCursor) + tab.commandBuffer.slice(tab.commandCursor + 1);
+      continue;
+    }
+    if (token === "\x1b[A" || token === "\x1b[B" || token === "\x1bOA" || token === "\x1bOB") {
+      navigateObservedHistory(tab, token === "\x1b[A" || token === "\x1bOA" ? -1 : 1);
+      continue;
+    }
+    if (token.startsWith("\x1b[") || token.startsWith("\x1bO") || token === "\t" || token < " ") continue;
+    tab.commandBuffer = tab.commandBuffer.slice(0, tab.commandCursor) + token + tab.commandBuffer.slice(tab.commandCursor);
+    tab.commandCursor += token.length;
+  }
+}
+
+function submitObservedCommand(tab: TerminalTab) {
+  const command = tab.commandBuffer.replace(/[\x00-\x1f\x7f]/g, "").replace(/\s+/g, " ").trim();
+  if (command) recordObservedCommand(tab, command);
+  resetObservedCommand(tab);
+}
+
+function recordObservedCommand(tab: TerminalTab, command: string) {
+  const normalized = command.replace(/[\x00-\x1f\x7f]/g, "").replace(/\s+/g, " ").trim();
+  if (!normalized) return;
+  if (tab.commandHistory.at(-1) !== normalized) tab.commandHistory.push(normalized);
+  if (tab.commandHistory.length > 100) tab.commandHistory.shift();
+  tab.commandHistoryIndex = tab.commandHistory.length;
+  if (!tab.manualTitle) setTabTitle(tab, normalized);
+}
+
+function resetObservedCommand(tab: TerminalTab) {
+  tab.commandBuffer = "";
+  tab.commandCursor = 0;
+  tab.commandHistoryIndex = tab.commandHistory.length;
+}
+
+function navigateObservedHistory(tab: TerminalTab, direction: number) {
+  if (!tab.commandHistory.length) return;
+  tab.commandHistoryIndex = Math.max(0, Math.min(tab.commandHistory.length, tab.commandHistoryIndex + direction));
+  tab.commandBuffer = tab.commandHistory[tab.commandHistoryIndex] ?? "";
+  tab.commandCursor = tab.commandBuffer.length;
+}
+
+function setTabTitle(tab: TerminalTab, value: string) {
+  tab.title = value.slice(0, 120);
+  persistWorkspace();
+  const title = document.querySelector<HTMLElement>(`[data-tab-title="${tab.id}"]`);
+  if (title && !title.isContentEditable) title.textContent = tab.title;
+}
+
+function isTerminalProtocolTitle(value: string) {
+  return /^\[(?:[?><=]|\d)[0-9;:?><=]*[A-Za-z~]/.test(value) || /^\](?:10|11|12);/.test(value);
+}
+
+function openTabRename(tabId: string) {
+  const tab = state.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+  if (state.activeTabId !== tabId) selectTab(tabId, false);
+  requestAnimationFrame(() => {
+    const title = document.querySelector<HTMLElement>(`[data-tab-title="${tabId}"]`);
+    if (!title) return;
+    const original = tab.title;
+    let cancelled = false;
+    title.contentEditable = "true";
+    title.classList.add("editing");
+    title.focus();
+    const selection = window.getSelection();
+    selection?.selectAllChildren(title);
+    title.onkeydown = (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter") {
+        event.preventDefault();
+        title.blur();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        cancelled = true;
+        title.textContent = original;
+        title.blur();
+      }
+    };
+    title.onblur = () => {
+      title.contentEditable = "false";
+      title.classList.remove("editing");
+      const value = title.textContent?.replace(/\s+/g, " ").trim() ?? "";
+      if (!cancelled && value) {
+        tab.manualTitle = true;
+        setTabTitle(tab, value);
+      } else {
+        title.textContent = original;
+      }
+      requestAnimationFrame(() => tab.terminal?.focus());
+    };
+  });
+}
+
+async function flushTerminalInput(tab: TerminalTab) {
+  if (tab.sendingInput) return;
+  tab.sendingInput = true;
+  try {
+    while (tab.inputQueue) {
+      const data = tab.inputQueue;
+      tab.inputQueue = "";
+      await backend("SendInput", tab.id, data);
     }
   } catch (error) {
-    pushOutput({ kind: "error", text: `Input failed: ${String(error)}` });
+    pushOutput(tab, { kind: "error", text: `Input failed: ${String(error)}` });
   } finally {
-    sendingInput = false;
-    if (inputQueue) void flushTerminalInput();
+    tab.sendingInput = false;
+    if (tab.inputQueue) void flushTerminalInput(tab);
   }
 }
 
-function fitTerminal() {
-  if (!terminalHost?.isConnected) return;
+function fitTerminal(tab: TerminalTab) {
+  if (!tab.host?.isConnected) return;
   try {
-    fitAddon?.fit();
+    tab.fitAddon?.fit();
   } catch {
     // The fit addon can run before WebView layout has completed.
   }
 }
 
-function scheduleTerminalResize(cols: number, rows: number) {
-  window.clearTimeout(resizeTimer);
-  resizeTimer = window.setTimeout(() => {
-    if (state.connection === "connected") void backend("ResizeTerminal", cols, rows);
+function fitVisibleTerminals() {
+  for (const tab of visibleTabs()) fitTerminal(tab);
+}
+
+function scheduleTerminalResize(tab: TerminalTab, cols: number, rows: number) {
+  window.clearTimeout(tab.resizeTimer);
+  tab.resizeTimer = window.setTimeout(() => {
+    if (tab.connection === "connected") void backend("ResizeTerminal", tab.id, cols, rows);
   }, 80);
 }
 
-function resetTerminal() {
-  inputQueue = "";
-  terminal?.reset();
-  terminal?.clear();
-  terminal?.writeln("\x1b[38;2;38;53;91mSSHKing secure terminal · session ready\x1b[0m");
-  terminal?.writeln("\x1b[38;2;75;83;103mPress Connect to open this server.\x1b[0m");
+function resetTerminal(tab: TerminalTab) {
+  tab.inputQueue = "";
+  resetObservedCommand(tab);
+  tab.output = [
+    { kind: "system", text: "SSHKing secure terminal · session ready" },
+    { kind: "muted", text: "Press Connect to open this server." },
+  ];
+  tab.remotePath = "~";
+  tab.terminal?.reset();
+  tab.terminal?.clear();
+  for (const line of tab.output) writeOutputLine(tab, line);
 }
 
-function connectionLabel() {
-  if (state.connection === "connected") return "Secure session";
-  if (state.connection === "connecting") return "Connecting";
-  if (state.connection === "error") return "Connection issue";
+function connectionLabel(tab = activeTab()) {
+  if (tab?.connection === "connected") return "Secure session";
+  if (tab?.connection === "connecting") return "Connecting";
+  if (tab?.connection === "error") return "Connection issue";
   return "Ready";
 }
 
 function currentRemotePath() {
-  return state.remotePaths[state.selectedId] || "~";
+  return activeTab()?.remotePath || "~";
 }
 
-function recordRemoteDirectory(value: string) {
+function parentRemotePath(value: string) {
+  if (!value || value === "~" || value === "/") return value || "~";
+  const clean = value.replace(/\/+$/, "");
+  const index = clean.lastIndexOf("/");
+  return index <= 0 ? "/" : clean.slice(0, index);
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function terminalFontFamily(value: Preferences["terminalFontFamily"]) {
+  if (value === "cascadia") return '"Cascadia Mono", "Cascadia Code", Consolas, monospace';
+  if (value === "jetbrains") return '"JetBrains Mono", "Cascadia Mono", Consolas, monospace';
+  if (value === "source-code") return '"Source Code Pro", "SFMono-Regular", Consolas, monospace';
+  return '"SFMono-Regular", "Cascadia Mono", Consolas, monospace';
+}
+
+function terminalTheme(theme: Preferences["theme"]) {
+  if (theme === "black") {
+    return {
+      background: "#00000000", foreground: "#e7e9f2", cursor: "#f1f2ff", cursorAccent: "#090a0e",
+      selectionBackground: "#7688ff52", black: "#090a0e", red: "#ff6f8a", green: "#77e5bd",
+      yellow: "#f1c86b", blue: "#86a8ff", magenta: "#d29cff", cyan: "#76e6ff", white: "#d9dce8",
+      brightBlack: "#777f93", brightRed: "#ff91a5", brightGreen: "#9af0d0", brightYellow: "#ffe19c",
+      brightBlue: "#adc2ff", brightMagenta: "#e4bdff", brightCyan: "#a6efff", brightWhite: "#ffffff",
+    };
+  }
+  return {
+    background: "#00000000", foreground: "#182033", cursor: "#27324d", cursorAccent: "#eef0f7",
+    selectionBackground: "#5366c04a", black: "#101522", red: "#a51d3d", green: "#146b50",
+    yellow: "#795800", blue: "#244f9e", magenta: "#71308f", cyan: "#006579", white: "#343b4d",
+    brightBlack: "#525a6d", brightRed: "#c52e50", brightGreen: "#168061", brightYellow: "#916a00",
+    brightBlue: "#315fba", brightMagenta: "#8b3eaa", brightCyan: "#007d94", brightWhite: "#151b2a",
+  };
+}
+
+function recordRemoteDirectory(tab: TerminalTab, value: string) {
   try {
     const location = new URL(value);
     if (location.protocol !== "file:") return;
     const path = decodeURIComponent(location.pathname);
-    if (path) state.remotePaths[state.selectedId] = path;
+    if (path) tab.remotePath = path;
   } catch {
     // Ignore malformed or non-standard shell integration messages.
   }
@@ -836,12 +1882,43 @@ async function initialise() {
   } catch {
     // Browser preview keeps the representative demo state.
   }
+  restoreWorkspace();
+  await loadTerminalTranscripts();
+  const initialTab = activeTab();
+  if (!window.go && initialTab?.serverId === "demo-1") initialTab.remotePath = "/srv/northstar";
   attachRuntimeEvents();
   render();
+  if (initialTab?.restoreSession && state.config.preferences.reopenActiveSession) {
+    requestAnimationFrame(() => void autoConnectTab(initialTab, true));
+  }
+}
+
+async function loadTerminalTranscripts() {
+  if (!state.config.preferences.persistTerminalHistory) return;
+  await Promise.all(state.tabs.map(async (tab) => {
+    try {
+      tab.restoredTranscript = String(await backend("GetSessionTranscript", tab.id) ?? "");
+    } catch {
+      tab.restoredTranscript = "";
+    }
+  }));
 }
 
 window.addEventListener("keydown", (event) => {
-  const terminalHasFocus = state.connection === "connected" && terminal?.textarea === document.activeElement;
+  const terminalHasFocus = state.tabs.some((tab) => tab.connection === "connected" && tab.terminal?.textarea === document.activeElement);
+  if (!state.modal && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    openTerminalSearch();
+    return;
+  }
+  if (!state.modal && (event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "p") {
+    event.preventDefault();
+    state.paletteQuery = "";
+    state.modal = "palette";
+    render();
+    requestAnimationFrame(() => document.querySelector<HTMLInputElement>("#palette-input")?.focus());
+    return;
+  }
   if (state.platform === "darwin" && event.metaKey && (event.code === "Comma" || event.key === ",")) {
     event.preventDefault();
     openModal("settings");
@@ -851,9 +1928,33 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     document.querySelector<HTMLInputElement>("#server-search")?.focus();
   }
+  if (!state.modal && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "t") {
+    event.preventDefault();
+    addTerminalTab();
+    return;
+  }
+  if (!state.modal && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "w") {
+    event.preventDefault();
+    void closeTerminalTab(state.activeTabId);
+    return;
+  }
+  if (!state.modal && event.ctrlKey && event.key === "Tab") {
+    event.preventDefault();
+    const index = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
+    const direction = event.shiftKey ? -1 : 1;
+    const next = state.tabs[(index + direction + state.tabs.length) % state.tabs.length];
+    if (next) selectTab(next.id);
+    return;
+  }
+  if (!state.modal && (event.metaKey || event.ctrlKey) && event.key === "\\") {
+    event.preventDefault();
+    toggleSplitPane();
+    return;
+  }
   if (event.key === "Escape" && state.modal) closeModal();
+  else if (event.key === "Escape" && state.terminalSearch) closeTerminalSearch();
 });
 
-window.addEventListener("resize", () => requestAnimationFrame(fitTerminal));
+window.addEventListener("resize", () => requestAnimationFrame(fitVisibleTerminals));
 
 void initialise();

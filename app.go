@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,10 +35,39 @@ type App struct {
 	ctx                context.Context
 	store              *config.Store
 	cfg                config.Config
-	session            *sshclient.Session
-	active             string
+	sessions           map[string]*managedSession
+	tunnels            map[string]*managedTunnel
 	mu                 sync.Mutex
 	biometricAvailable bool
+}
+
+type managedSession struct {
+	serverID string
+	session  *sshclient.Session
+}
+
+type managedTunnel struct {
+	sessionID  string
+	remoteHost string
+	remotePort int
+	forward    *sshclient.Forward
+}
+
+type TunnelInfo struct {
+	ID         string `json:"id"`
+	SessionID  string `json:"sessionId"`
+	Local      string `json:"local"`
+	RemoteHost string `json:"remoteHost"`
+	RemotePort int    `json:"remotePort"`
+}
+
+type RemoteFile struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	IsDir   bool   `json:"isDir"`
+	Size    int64  `json:"size"`
+	Mode    string `json:"mode"`
+	ModTime int64  `json:"modTime"`
 }
 
 func NewApp() (*App, error) {
@@ -44,7 +79,13 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{store: store, cfg: cfg, biometricAvailable: biometric.Available()}, nil
+	return &App{
+		store:              store,
+		cfg:                cfg,
+		sessions:           make(map[string]*managedSession),
+		tunnels:            make(map[string]*managedTunnel),
+		biometricAvailable: biometric.Available(),
+	}, nil
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -54,9 +95,14 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(_ context.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.session != nil {
-		_ = a.session.Close()
+	for _, managed := range a.sessions {
+		_ = managed.session.Close()
 	}
+	for _, tunnel := range a.tunnels {
+		_ = tunnel.forward.Close()
+	}
+	a.sessions = make(map[string]*managedSession)
+	a.tunnels = make(map[string]*managedTunnel)
 }
 
 func (a *App) GetState() InitialState {
@@ -78,6 +124,15 @@ func (a *App) SaveServer(server config.Server) (config.Config, error) {
 	}
 	if server.Port < 1 || server.Port > 65535 {
 		return a.cfg, errors.New("port must be between 1 and 65535")
+	}
+	server.TmuxSession = strings.TrimSpace(server.TmuxSession)
+	if server.UseTmux {
+		if server.TmuxSession == "" {
+			server.TmuxSession = "sshking"
+		}
+		if !validTmuxSessionName(server.TmuxSession) {
+			return a.cfg, errors.New("tmux session name may contain only letters, numbers, hyphens, and underscores")
+		}
 	}
 	if server.ID == "" {
 		server.ID = newID()
@@ -110,10 +165,12 @@ func (a *App) DeleteServer(id string) (config.Config, error) {
 				return a.cfg, fmt.Errorf("delete saved password: %w", err)
 			}
 			a.cfg.Servers = append(a.cfg.Servers[:i], a.cfg.Servers[i+1:]...)
-			if a.active == id && a.session != nil {
-				_ = a.session.Close()
-				a.session = nil
-				a.active = ""
+			for sessionID, managed := range a.sessions {
+				if managed.serverID == id {
+					_ = managed.session.Close()
+					a.closeSessionTunnelsLocked(sessionID)
+					delete(a.sessions, sessionID)
+				}
 			}
 			return a.cfg, a.store.Save(a.cfg)
 		}
@@ -130,22 +187,101 @@ func (a *App) SavePreferences(preferences config.Preferences) (config.Config, er
 	if preferences.Scrollback < 100 || preferences.Scrollback > 10000 {
 		return a.cfg, errors.New("scrollback must be between 100 and 10000")
 	}
+	if preferences.Theme != "light" && preferences.Theme != "black" && preferences.Theme != "glass" {
+		return a.cfg, errors.New("theme must be light, black, or glass")
+	}
+	if preferences.UIScale < 80 || preferences.UIScale > 140 {
+		return a.cfg, errors.New("interface scale must be between 80 and 140 percent")
+	}
+	if preferences.TerminalFontSize < 10 || preferences.TerminalFontSize > 28 {
+		return a.cfg, errors.New("terminal font size must be between 10 and 28")
+	}
+	if preferences.TerminalLineHeight < 100 || preferences.TerminalLineHeight > 200 {
+		return a.cfg, errors.New("terminal line height must be between 100 and 200 percent")
+	}
+	switch preferences.TerminalFontFamily {
+	case "system-mono", "cascadia", "jetbrains", "source-code":
+	default:
+		return a.cfg, errors.New("unsupported terminal font family")
+	}
 	a.cfg.Preferences = preferences
 	return a.cfg, a.store.Save(a.cfg)
 }
 
-func (a *App) Connect(id, password string, rememberPassword, requireBiometric, trustNewHost bool) error {
+func (a *App) GetSessionTranscript(sessionID string) (string, error) {
 	a.mu.Lock()
-	if a.session != nil {
-		_ = a.session.Close()
-		a.session = nil
-		a.active = ""
+	enabled := a.cfg.Preferences.PersistTerminalHistory
+	a.mu.Unlock()
+	if !enabled {
+		return "", nil
+	}
+	return a.store.Transcript(sessionID)
+}
+
+func (a *App) ClearSessionTranscript(sessionID string) error {
+	return a.store.ClearTranscript(sessionID)
+}
+
+func (a *App) ClearTerminalHistory() error {
+	return a.store.ClearTranscripts()
+}
+
+func (a *App) ImportSSHConfig(path string) (config.Config, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	imported, err := config.ImportOpenSSH(path, a.cfg.Preferences)
+	if err != nil {
+		return a.cfg, fmt.Errorf("import SSH config: %w", err)
+	}
+	for _, candidate := range imported {
+		duplicate := false
+		for _, existing := range a.cfg.Servers {
+			if existing.Name == candidate.Name || (existing.Host == candidate.Host && existing.User == candidate.User && existing.Port == candidate.Port) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		candidate.ID = newID()
+		a.cfg.Servers = append(a.cfg.Servers, candidate)
+	}
+	if err := a.store.Save(a.cfg); err != nil {
+		return a.cfg, err
+	}
+	return a.cfg, nil
+}
+
+func (a *App) GetActivity(limit int) ([]string, error) {
+	return a.store.Activity(limit)
+}
+
+func (a *App) Connect(sessionID, id, password string, rememberPassword, requireBiometric, trustNewHost bool) error {
+	if sessionID == "" {
+		return errors.New("session ID is required")
+	}
+	a.mu.Lock()
+	if existing := a.sessions[sessionID]; existing != nil {
+		_ = existing.session.Close()
+		delete(a.sessions, sessionID)
 	}
 	server, ok := a.server(id)
+	var jumpServer config.Server
+	var jumpOK bool
+	if ok && server.JumpServerID != "" {
+		jumpServer, jumpOK = a.server(server.JumpServerID)
+	}
 	logActivity := a.cfg.Preferences.LogActivity
 	a.mu.Unlock()
 	if !ok {
 		return errors.New("server not found")
+	}
+	if server.JumpServerID != "" && !jumpOK {
+		return errors.New("configured jump host was not found")
+	}
+	if server.UseTmux {
+		server.TmuxSession = tmuxSessionForTab(server.TmuxSession, sessionID)
 	}
 
 	loadedSavedPassword := false
@@ -166,12 +302,33 @@ func (a *App) Connect(id, password string, rememberPassword, requireBiometric, t
 		loadedSavedPassword = true
 	}
 
-	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "connecting", "serverId": id})
-	session, err := sshclient.Connect(server, password, trustNewHost)
+	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "connecting", "sessionId": sessionID, "serverId": id})
+	var session *sshclient.Session
+	var err error
+	if jumpOK {
+		jumpPassword := ""
+		if jumpServer.PasswordSaved {
+			if jumpServer.RequireBiometric {
+				if !a.biometricAvailable {
+					return fmt.Errorf("%s is unavailable for jump host %s", biometric.Name, jumpServer.Name)
+				}
+				if err := biometric.Authenticate("Unlock the jump host password for " + jumpServer.Name); err != nil {
+					return err
+				}
+			}
+			jumpPassword, err = credentials.Get(jumpServer.ID)
+			if err != nil {
+				return fmt.Errorf("retrieve jump host password: %w", err)
+			}
+		}
+		session, err = sshclient.ConnectVia(server, password, jumpServer, jumpPassword, trustNewHost)
+	} else {
+		session, err = sshclient.Connect(server, password, trustNewHost)
+	}
 	if err != nil {
 		var hostKeyErr *sshclient.HostKeyVerificationError
 		if !errors.As(err, &hostKeyErr) {
-			wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "error", "message": err.Error()})
+			wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "error", "sessionId": sessionID, "serverId": id, "message": err.Error()})
 		}
 		return err
 	}
@@ -205,35 +362,34 @@ func (a *App) Connect(id, password string, rememberPassword, requireBiometric, t
 		_ = session.Close()
 		return fmt.Errorf("save credential preferences: %w", err)
 	}
-	a.session = session
-	a.active = id
+	a.sessions[sessionID] = &managedSession{serverID: id, session: session}
 	a.mu.Unlock()
 	if logActivity {
 		_ = a.store.Log(server.Name, "connect", server.User+"@"+server.Host)
 	}
-	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "connected", "serverId": id})
-	go a.consume(session)
+	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "connected", "sessionId": sessionID, "serverId": id})
+	go a.consume(sessionID, session)
 	return nil
 }
 
-func (a *App) SendInput(data string) error {
+func (a *App) SendInput(sessionID, data string) error {
 	a.mu.Lock()
-	session := a.session
+	managed := a.sessions[sessionID]
 	a.mu.Unlock()
-	if session == nil {
+	if managed == nil {
 		return errors.New("not connected")
 	}
-	return session.SendInput(data)
+	return managed.session.SendInput(data)
 }
 
-func (a *App) ResizeTerminal(columns, rows int) error {
+func (a *App) ResizeTerminal(sessionID string, columns, rows int) error {
 	a.mu.Lock()
-	session := a.session
+	managed := a.sessions[sessionID]
 	a.mu.Unlock()
-	if session == nil {
+	if managed == nil {
 		return nil
 	}
-	return session.Resize(columns, rows)
+	return managed.session.Resize(columns, rows)
 }
 
 func (a *App) OpenInZed(id, remotePath string, newWindow, passSavedPassword bool) error {
@@ -334,16 +490,20 @@ func (a *App) InstallSSHKey(id, publicKeyPath, password string, generate bool) (
 	return updated, nil
 }
 
-func (a *App) SendCommand(command string) error {
+func (a *App) SendCommand(sessionID, command string) error {
 	a.mu.Lock()
-	session := a.session
-	server, ok := a.server(a.active)
+	managed := a.sessions[sessionID]
 	logActivity := a.cfg.Preferences.LogActivity
+	var server config.Server
+	var ok bool
+	if managed != nil {
+		server, ok = a.server(managed.serverID)
+	}
 	a.mu.Unlock()
-	if session == nil {
+	if managed == nil {
 		return errors.New("not connected")
 	}
-	if err := session.Send(command); err != nil {
+	if err := managed.session.Send(command); err != nil {
 		return err
 	}
 	if ok && logActivity {
@@ -352,34 +512,204 @@ func (a *App) SendCommand(command string) error {
 	return nil
 }
 
-func (a *App) Disconnect() {
+func (a *App) Disconnect(sessionID string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.session != nil {
-		_ = a.session.Close()
+	managed := a.sessions[sessionID]
+	if managed != nil {
+		delete(a.sessions, sessionID)
 	}
-	a.session = nil
-	a.active = ""
-	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "disconnected"})
+	a.closeSessionTunnelsLocked(sessionID)
+	a.mu.Unlock()
+	if managed != nil {
+		_ = managed.session.Close()
+	}
+	wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "disconnected", "sessionId": sessionID})
 }
 
-func (a *App) consume(session *sshclient.Session) {
+func (a *App) StartLocalTunnel(sessionID string, localPort int, remoteHost string, remotePort int) (TunnelInfo, error) {
+	if localPort < 0 || localPort > 65535 || remotePort < 1 || remotePort > 65535 {
+		return TunnelInfo{}, errors.New("invalid tunnel port")
+	}
+	if remoteHost == "" {
+		return TunnelInfo{}, errors.New("remote host is required")
+	}
+	managed, err := a.managedSession(sessionID)
+	if err != nil {
+		return TunnelInfo{}, err
+	}
+	forward, err := managed.session.ForwardLocal(
+		sshclient.TunnelAddress("127.0.0.1", localPort),
+		sshclient.TunnelAddress(remoteHost, remotePort),
+	)
+	if err != nil {
+		return TunnelInfo{}, fmt.Errorf("start local tunnel: %w", err)
+	}
+	id := newID()
+	tunnel := &managedTunnel{sessionID: sessionID, remoteHost: remoteHost, remotePort: remotePort, forward: forward}
+	a.mu.Lock()
+	a.tunnels[id] = tunnel
+	a.mu.Unlock()
+	return TunnelInfo{ID: id, SessionID: sessionID, Local: forward.Address(), RemoteHost: remoteHost, RemotePort: remotePort}, nil
+}
+
+func (a *App) StopTunnel(id string) error {
+	a.mu.Lock()
+	tunnel := a.tunnels[id]
+	delete(a.tunnels, id)
+	a.mu.Unlock()
+	if tunnel == nil {
+		return errors.New("tunnel not found")
+	}
+	return tunnel.forward.Close()
+}
+
+func (a *App) closeSessionTunnelsLocked(sessionID string) {
+	for id, tunnel := range a.tunnels {
+		if tunnel.sessionID == sessionID {
+			_ = tunnel.forward.Close()
+			delete(a.tunnels, id)
+		}
+	}
+}
+
+func (a *App) ListRemoteFiles(sessionID, remotePath string) ([]RemoteFile, error) {
+	managed, err := a.managedSession(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	client, err := managed.session.NewSFTPClient()
+	if err != nil {
+		return nil, fmt.Errorf("start SFTP: %w", err)
+	}
+	defer client.Close()
+	if remotePath == "" || remotePath == "~" {
+		if remotePath, err = client.Getwd(); err != nil {
+			return nil, err
+		}
+	}
+	entries, err := client.ReadDir(remotePath)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]RemoteFile, 0, len(entries))
+	for _, entry := range entries {
+		files = append(files, RemoteFile{
+			Name: entry.Name(), Path: path.Join(remotePath, entry.Name()), IsDir: entry.IsDir(),
+			Size: entry.Size(), Mode: entry.Mode().String(), ModTime: entry.ModTime().Unix(),
+		})
+	}
+	return files, nil
+}
+
+func (a *App) DownloadRemoteFile(sessionID, remotePath string) (string, error) {
+	managed, err := a.managedSession(sessionID)
+	if err != nil {
+		return "", err
+	}
+	destination, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{DefaultFilename: path.Base(remotePath)})
+	if err != nil || destination == "" {
+		return destination, err
+	}
+	client, err := managed.session.NewSFTPClient()
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	source, err := client.Open(remotePath)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	target, err := os.Create(destination)
+	if err != nil {
+		return "", err
+	}
+	defer target.Close()
+	if _, err := io.Copy(target, source); err != nil {
+		return "", err
+	}
+	return destination, nil
+}
+
+func (a *App) UploadRemoteFile(sessionID, remoteDirectory string) (string, error) {
+	managed, err := a.managedSession(sessionID)
+	if err != nil {
+		return "", err
+	}
+	sourcePath, err := wailsruntime.OpenFileDialog(a.ctx, wailsruntime.OpenDialogOptions{Title: "Upload file"})
+	if err != nil || sourcePath == "" {
+		return "", err
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	client, err := managed.session.NewSFTPClient()
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	if remoteDirectory == "" || remoteDirectory == "~" {
+		if remoteDirectory, err = client.Getwd(); err != nil {
+			return "", err
+		}
+	}
+	remotePath := path.Join(remoteDirectory, filepath.Base(sourcePath))
+	target, err := client.Create(remotePath)
+	if err != nil {
+		return "", err
+	}
+	defer target.Close()
+	if _, err := io.Copy(target, source); err != nil {
+		return "", err
+	}
+	return remotePath, nil
+}
+
+func (a *App) managedSession(sessionID string) (*managedSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	managed := a.sessions[sessionID]
+	if managed == nil {
+		return nil, errors.New("session is not connected")
+	}
+	return managed, nil
+}
+
+func (a *App) consume(sessionID string, session *sshclient.Session) {
 	for {
 		select {
 		case output := <-session.Output():
-			wailsruntime.EventsEmit(a.ctx, "terminal:data", output)
+			a.mu.Lock()
+			managed := a.sessions[sessionID]
+			current := managed != nil && managed.session == session
+			persistTranscript := a.cfg.Preferences.PersistTerminalHistory
+			a.mu.Unlock()
+			if !current {
+				return
+			}
+			if persistTranscript {
+				_ = a.store.AppendTranscript(sessionID, output)
+			}
+			wailsruntime.EventsEmit(a.ctx, "terminal:data", map[string]any{"sessionId": sessionID, "data": output})
 		case err := <-session.Done():
 			a.mu.Lock()
-			if a.session == session {
-				a.session = nil
-				a.active = ""
+			current := false
+			if managed := a.sessions[sessionID]; managed != nil && managed.session == session {
+				current = true
+				delete(a.sessions, sessionID)
+				a.closeSessionTunnelsLocked(sessionID)
 			}
 			a.mu.Unlock()
+			if !current {
+				return
+			}
 			message := ""
 			if err != nil {
 				message = err.Error()
 			}
-			wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "disconnected", "message": message})
+			wailsruntime.EventsEmit(a.ctx, "terminal:status", map[string]any{"state": "disconnected", "sessionId": sessionID, "message": message})
 			return
 		}
 	}
@@ -396,6 +726,33 @@ func (a *App) server(id string) (config.Server, bool) {
 
 func newID() string {
 	return fmt.Sprintf("%x", timeNowUnixNano())
+}
+
+func validTmuxSessionName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func tmuxSessionForTab(base, sessionID string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "sshking"
+	}
+	sum := sha256.Sum256([]byte(sessionID))
+	suffix := fmt.Sprintf("%x", sum[:6])
+	maxBaseLength := 64 - len(suffix) - 1
+	if len(base) > maxBaseLength {
+		base = base[:maxBaseLength]
+	}
+	return base + "-" + suffix
 }
 
 var timeNowUnixNano = func() int64 {

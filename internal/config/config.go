@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -13,11 +14,15 @@ import (
 type Server struct {
 	ID               string `json:"id"`
 	Name             string `json:"name"`
+	Group            string `json:"group,omitempty"`
 	Host             string `json:"host"`
 	Port             int    `json:"port"`
 	User             string `json:"user"`
 	Shell            string `json:"shell"`
+	UseTmux          bool   `json:"useTmux,omitempty"`
+	TmuxSession      string `json:"tmuxSession,omitempty"`
 	Identity         string `json:"identity,omitempty"`
+	JumpServerID     string `json:"jumpServerId,omitempty"`
 	Fingerprint      string `json:"fingerprint,omitempty"`
 	Favorite         bool   `json:"favorite,omitempty"`
 	PasswordSaved    bool   `json:"passwordSaved,omitempty"`
@@ -25,12 +30,20 @@ type Server struct {
 }
 
 type Preferences struct {
-	DefaultUser     string `json:"defaultUser"`
-	DefaultPort     int    `json:"defaultPort"`
-	DefaultShell    string `json:"defaultShell"`
-	DefaultIdentity string `json:"defaultIdentity,omitempty"`
-	LogActivity     bool   `json:"logActivity"`
-	Scrollback      int    `json:"scrollback"`
+	DefaultUser            string `json:"defaultUser"`
+	DefaultPort            int    `json:"defaultPort"`
+	DefaultShell           string `json:"defaultShell"`
+	DefaultIdentity        string `json:"defaultIdentity,omitempty"`
+	LogActivity            bool   `json:"logActivity"`
+	Scrollback             int    `json:"scrollback"`
+	Theme                  string `json:"theme"`
+	UIScale                int    `json:"uiScale"`
+	TerminalFontSize       int    `json:"terminalFontSize"`
+	TerminalFontFamily     string `json:"terminalFontFamily"`
+	TerminalLineHeight     int    `json:"terminalLineHeight"`
+	AutoConnectTabs        bool   `json:"autoConnectTabs"`
+	ReopenActiveSession    bool   `json:"reopenActiveSession"`
+	PersistTerminalHistory bool   `json:"persistTerminalHistory"`
 }
 
 type Config struct {
@@ -66,11 +79,19 @@ func Default() Config {
 	return Config{
 		Servers: []Server{},
 		Preferences: Preferences{
-			DefaultUser:  user,
-			DefaultPort:  22,
-			DefaultShell: "default",
-			LogActivity:  true,
-			Scrollback:   2000,
+			DefaultUser:            user,
+			DefaultPort:            22,
+			DefaultShell:           "default",
+			LogActivity:            true,
+			Scrollback:             2000,
+			Theme:                  "glass",
+			UIScale:                100,
+			TerminalFontSize:       14,
+			TerminalFontFamily:     "system-mono",
+			TerminalLineHeight:     140,
+			AutoConnectTabs:        true,
+			ReopenActiveSession:    true,
+			PersistTerminalHistory: true,
 		},
 	}
 }
@@ -129,6 +150,43 @@ func (s *Store) Log(serverName, kind, message string) error {
 	return err
 }
 
+func (s *Store) Activity(limit int) ([]string, error) {
+	if limit < 1 {
+		limit = 200
+	}
+	logDir := filepath.Join(s.dir, "logs")
+	files, err := os.ReadDir(logDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
+	var lines []string
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".log") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(logDir, file.Name()))
+		if readErr != nil {
+			return nil, readErr
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if strings.TrimSpace(line) != "" {
+				lines = append(lines, file.Name()+"  "+line)
+			}
+		}
+	}
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	for left, right := 0, len(lines)-1; left < right; left, right = left+1, right-1 {
+		lines[left], lines[right] = lines[right], lines[left]
+	}
+	return lines, nil
+}
+
 func normalize(cfg *Config) {
 	if cfg.Preferences.DefaultPort <= 0 {
 		cfg.Preferences.DefaultPort = 22
@@ -142,12 +200,34 @@ func normalize(cfg *Config) {
 	if cfg.Preferences.Scrollback > 10000 {
 		cfg.Preferences.Scrollback = 10000
 	}
+	switch cfg.Preferences.Theme {
+	case "light", "black", "glass":
+	default:
+		cfg.Preferences.Theme = "glass"
+	}
+	if cfg.Preferences.UIScale < 80 || cfg.Preferences.UIScale > 140 {
+		cfg.Preferences.UIScale = 100
+	}
+	if cfg.Preferences.TerminalFontSize < 10 || cfg.Preferences.TerminalFontSize > 28 {
+		cfg.Preferences.TerminalFontSize = 14
+	}
+	switch cfg.Preferences.TerminalFontFamily {
+	case "system-mono", "cascadia", "jetbrains", "source-code":
+	default:
+		cfg.Preferences.TerminalFontFamily = "system-mono"
+	}
+	if cfg.Preferences.TerminalLineHeight < 100 || cfg.Preferences.TerminalLineHeight > 200 {
+		cfg.Preferences.TerminalLineHeight = 140
+	}
 	for i := range cfg.Servers {
 		if cfg.Servers[i].Port <= 0 {
 			cfg.Servers[i].Port = 22
 		}
 		if cfg.Servers[i].Shell == "" {
 			cfg.Servers[i].Shell = cfg.Preferences.DefaultShell
+		}
+		if cfg.Servers[i].UseTmux && strings.TrimSpace(cfg.Servers[i].TmuxSession) == "" {
+			cfg.Servers[i].TmuxSession = "sshking"
 		}
 	}
 }
