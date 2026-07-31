@@ -17,6 +17,7 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"sshking/internal/biometric"
+	"sshking/internal/cloudclient"
 	"sshking/internal/config"
 	"sshking/internal/credentials"
 	"sshking/internal/editor"
@@ -39,6 +40,7 @@ type App struct {
 	tunnels            map[string]*managedTunnel
 	mu                 sync.Mutex
 	biometricAvailable bool
+	cloud              *cloudclient.Client
 }
 
 type managedSession struct {
@@ -85,7 +87,34 @@ func NewApp() (*App, error) {
 		sessions:           make(map[string]*managedSession),
 		tunnels:            make(map[string]*managedTunnel),
 		biometricAvailable: biometric.Available(),
+		cloud:              cloudclient.New(),
 	}, nil
+}
+
+func (a *App) GetCloudState(cloudURL string) (cloudclient.State, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+	defer cancel()
+	return a.cloud.Status(ctx, cloudURL)
+}
+
+func (a *App) LoginCloud(cloudURL, provider string) (cloudclient.State, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 4*time.Minute)
+	defer cancel()
+	state, err := a.cloud.Login(ctx, cloudURL, provider, func(target string) {
+		wailsruntime.BrowserOpenURL(a.ctx, target)
+	})
+	if err != nil {
+		return cloudclient.State{}, err
+	}
+	a.mu.Lock()
+	a.cfg.Preferences.CloudURL = strings.TrimRight(strings.TrimSpace(cloudURL), "/")
+	err = a.store.Save(a.cfg)
+	a.mu.Unlock()
+	return state, err
+}
+
+func (a *App) LogoutCloud(cloudURL string) error {
+	return a.cloud.Logout(cloudURL)
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -125,6 +154,9 @@ func (a *App) SaveServer(server config.Server) (config.Config, error) {
 	if server.Port < 1 || server.Port > 65535 {
 		return a.cfg, errors.New("port must be between 1 and 65535")
 	}
+	if server.TeamID != "" && !a.teamExists(server.TeamID) {
+		return a.cfg, errors.New("selected team was not found")
+	}
 	server.TmuxSession = strings.TrimSpace(server.TmuxSession)
 	if server.UseTmux {
 		if server.TmuxSession == "" {
@@ -154,6 +186,55 @@ func (a *App) SaveServer(server config.Server) (config.Config, error) {
 		return a.cfg, err
 	}
 	return a.cfg, nil
+}
+
+func (a *App) SaveTeam(team config.Team) (config.Config, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	team.Name = strings.TrimSpace(team.Name)
+	if team.Name == "" {
+		return a.cfg, errors.New("team name is required")
+	}
+	for _, existing := range a.cfg.Teams {
+		if existing.ID != team.ID && strings.EqualFold(existing.Name, team.Name) {
+			return a.cfg, errors.New("a team with this name already exists")
+		}
+	}
+	if team.ID == "" {
+		team.ID = newID()
+		a.cfg.Teams = append(a.cfg.Teams, team)
+	} else {
+		found := false
+		for i := range a.cfg.Teams {
+			if a.cfg.Teams[i].ID == team.ID {
+				a.cfg.Teams[i] = team
+				found = true
+				break
+			}
+		}
+		if !found {
+			return a.cfg, errors.New("team not found")
+		}
+	}
+	return a.cfg, a.store.Save(a.cfg)
+}
+
+func (a *App) DeleteTeam(id string) (config.Config, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.cfg.Teams {
+		if a.cfg.Teams[i].ID != id {
+			continue
+		}
+		a.cfg.Teams = append(a.cfg.Teams[:i], a.cfg.Teams[i+1:]...)
+		for serverIndex := range a.cfg.Servers {
+			if a.cfg.Servers[serverIndex].TeamID == id {
+				a.cfg.Servers[serverIndex].TeamID = ""
+			}
+		}
+		return a.cfg, a.store.Save(a.cfg)
+	}
+	return a.cfg, errors.New("team not found")
 }
 
 func (a *App) DeleteServer(id string) (config.Config, error) {
@@ -722,6 +803,15 @@ func (a *App) server(id string) (config.Server, bool) {
 		}
 	}
 	return config.Server{}, false
+}
+
+func (a *App) teamExists(id string) bool {
+	for _, team := range a.cfg.Teams {
+		if team.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func newID() string {

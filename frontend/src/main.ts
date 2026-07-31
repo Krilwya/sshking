@@ -6,6 +6,7 @@ import { SearchAddon } from "@xterm/addon-search";
 
 type Server = {
   id: string;
+  teamId?: string;
   name: string;
   group?: string;
   host: string;
@@ -22,7 +23,13 @@ type Server = {
   requireBiometric?: boolean;
 };
 
+type Team = {
+  id: string;
+  name: string;
+};
+
 type Preferences = {
+  cloudUrl?: string;
   defaultUser: string;
   defaultPort: number;
   defaultShell: string;
@@ -39,7 +46,14 @@ type Preferences = {
   persistTerminalHistory: boolean;
 };
 
-type Config = { servers: Server[]; preferences: Preferences };
+type Config = { servers: Server[]; teams: Team[]; preferences: Preferences };
+type CloudState = {
+  cloudUrl: string;
+  signedIn: boolean;
+  user: { id: string; displayName: string; email: string; avatarUrl: string };
+  providers: Record<"google" | "apple", boolean>;
+  error?: string;
+};
 type Platform = "darwin" | "windows" | "linux";
 type PublicKeyInfo = {
   path: string;
@@ -127,12 +141,16 @@ const icons = {
 };
 
 const demoConfig: Config = {
+  teams: [
+    { id: "team-northstar", name: "Northstar" },
+  ],
   servers: [
     { id: "demo-1", name: "Production", host: "api.northstar.dev", port: 22, user: "deploy", shell: "zsh", useTmux: true, tmuxSession: "sshking", identity: "~/.ssh/id_ed25519", favorite: true, passwordSaved: true, requireBiometric: true },
-    { id: "demo-2", name: "Staging", host: "stage.northstar.dev", port: 22, user: "ubuntu", shell: "bash", favorite: true },
+    { id: "demo-2", teamId: "team-northstar", name: "Staging", host: "stage.northstar.dev", port: 22, user: "ubuntu", shell: "bash", favorite: true },
     { id: "demo-3", name: "Home lab", host: "192.168.1.42", port: 22, user: "operator", shell: "fish" },
   ],
   preferences: {
+    cloudUrl: "https://cloud.krilwya.fr",
     defaultUser: "admin",
     defaultPort: 22,
     defaultShell: "default",
@@ -158,8 +176,13 @@ const state = {
   tabs: [] as TerminalTab[],
   activeTabId: "",
   splitTabId: "",
-  modal: "" as "" | "server" | "settings" | "activity" | "connect" | "zed" | "ssh-key" | "files" | "tunnels" | "palette" | "trust-host-key",
+  modal: "" as "" | "server" | "team" | "account" | "settings" | "activity" | "connect" | "zed" | "ssh-key" | "files" | "tunnels" | "palette" | "trust-host-key",
   editingId: "",
+  editingTeamId: "",
+  pendingServerTeamId: "",
+  personalExpanded: true,
+  teamsExpanded: true,
+  collapsedTeamIds: new Set<string>(),
   sshKeys: [] as PublicKeyInfo[],
   biometricAvailable: false,
   biometricName: "Device authentication",
@@ -173,6 +196,8 @@ const state = {
   terminalSearch: false,
   terminalSearchQuery: "",
   activity: [] as string[],
+  cloud: { cloudUrl: "", signedIn: false, user: { id: "", displayName: "", email: "", avatarUrl: "" }, providers: { google: false, apple: false } } as CloudState,
+  cloudLoading: false,
 };
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -205,10 +230,27 @@ async function mockBackend(name: string, args: unknown[]) {
     state.config.servers = state.config.servers.filter((item) => item.id !== args[0]);
     return state.config;
   }
+  if (name === "SaveTeam") {
+    const team = args[0] as Team;
+    if (!team.id) team.id = `team-${Date.now()}`;
+    const index = state.config.teams.findIndex((item) => item.id === team.id);
+    if (index >= 0) state.config.teams[index] = team;
+    else state.config.teams.push(team);
+    return state.config;
+  }
+  if (name === "DeleteTeam") {
+    const teamId = String(args[0]);
+    state.config.teams = state.config.teams.filter((team) => team.id !== teamId);
+    state.config.servers.forEach((server) => { if (server.teamId === teamId) server.teamId = ""; });
+    return state.config;
+  }
   if (name === "SavePreferences") {
     state.config.preferences = args[0] as Preferences;
     return state.config;
   }
+  if (name === "GetCloudState") return { cloudUrl: args[0], signedIn: false, user: {}, providers: { google: false, apple: false } };
+  if (name === "LoginCloud") return { cloudUrl: args[0], signedIn: true, user: { id: "demo", displayName: "Demo User", email: "demo@example.com", avatarUrl: "" }, providers: { google: true, apple: true } };
+  if (name === "LogoutCloud") return;
   if (name === "GetSessionTranscript") return "";
   if (name === "ClearSessionTranscript" || name === "ClearTerminalHistory") return;
   if (name === "Connect") {
@@ -320,6 +362,35 @@ function persistWorkspace() {
   }
 }
 
+function restoreSidebarState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("sshking.sidebar.v1") ?? "{}") as {
+      personalExpanded?: boolean;
+      teamsExpanded?: boolean;
+      collapsedTeamIds?: string[];
+    };
+    state.personalExpanded = saved.personalExpanded ?? true;
+    state.teamsExpanded = saved.teamsExpanded ?? true;
+    state.collapsedTeamIds = new Set(saved.collapsedTeamIds ?? []);
+  } catch {
+    state.personalExpanded = true;
+    state.teamsExpanded = true;
+    state.collapsedTeamIds.clear();
+  }
+}
+
+function persistSidebarState() {
+  try {
+    localStorage.setItem("sshking.sidebar.v1", JSON.stringify({
+      personalExpanded: state.personalExpanded,
+      teamsExpanded: state.teamsExpanded,
+      collapsedTeamIds: Array.from(state.collapsedTeamIds),
+    }));
+  } catch {
+    // Sidebar expansion is only a local convenience.
+  }
+}
+
 function activeTab() {
   return state.tabs.find((tab) => tab.id === state.activeTabId) ?? state.tabs[0];
 }
@@ -423,10 +494,7 @@ function render() {
           <span class="brand-mark">${icons.terminal}</span>
           <span>SSHKing</span>
         </div>
-        <div class="session-island">
-          <span class="status-dot ${active?.connection ?? "idle"}"></span>
-          <span>${connectionLabel(active)}</span>
-        </div>
+        ${accountButtonMarkup()}
         ${windowControlsMarkup()}
       </header>
 
@@ -522,25 +590,51 @@ function windowControlsMarkup() {
 
 function serverList() {
   const query = state.query.toLowerCase().trim();
-  const servers = state.config.servers.filter((server) =>
-    `${server.name} ${server.host} ${server.user}`.toLowerCase().includes(query),
-  );
-  if (!servers.length) {
-    return `<div class="empty-servers"><span>${icons.server}</span><strong>No servers found</strong><small>Try another search or add one.</small></div>`;
-  }
-  const favorite = servers.filter((server) => server.favorite);
-  const others = servers.filter((server) => !server.favorite);
-  const grouped = new Map<string, Server[]>();
-  for (const server of others) {
-    const label = server.group?.trim() || "All servers";
-    grouped.set(label, [...(grouped.get(label) ?? []), server]);
-  }
-  return [groupMarkup("Pinned", favorite), ...Array.from(grouped, ([label, items]) => groupMarkup(label, items))].join("");
+  const matches = (server: Server, teamName = "") => !query ||
+    `${server.name} ${server.host} ${server.user} ${server.group ?? ""} ${teamName}`.toLowerCase().includes(query);
+  const personal = state.config.servers.filter((server) => !server.teamId && matches(server));
+  const personalOpen = Boolean(query) || state.personalExpanded;
+  const teamsOpen = Boolean(query) || state.teamsExpanded;
+
+  const personalSection = `<section class="server-scope">
+    <div class="scope-heading">
+      <button type="button" class="scope-toggle" data-toggle-scope="personal"><span class="fold-caret ${personalOpen ? "open" : ""}">${icons.chevron}</span><strong>Personal Servers</strong><small>${personal.length}</small></button>
+      <button type="button" class="scope-add" data-add-server-team="" title="Add personal server" aria-label="Add personal server">${icons.plus}</button>
+    </div>
+    ${personalOpen ? `<div class="scope-content">${serverCardsMarkup(personal) || emptyScopeMarkup(query ? "No matching personal servers" : "No personal servers yet")}</div>` : ""}
+  </section>`;
+
+  const teamSections = state.config.teams.map((team) => {
+    const servers = state.config.servers.filter((server) => server.teamId === team.id && matches(server, team.name));
+    if (query && !servers.length && !team.name.toLowerCase().includes(query)) return "";
+    const open = Boolean(query) || !state.collapsedTeamIds.has(team.id);
+    return `<section class="team-scope">
+      <div class="team-heading">
+        <button type="button" class="team-toggle" data-toggle-team="${escapeHtml(team.id)}"><span class="fold-caret ${open ? "open" : ""}">${icons.chevron}</span><span class="team-avatar">${initials(team.name)}</span><strong>${escapeHtml(team.name)}</strong><small>${servers.length}</small></button>
+        <button type="button" class="scope-add" data-add-server-team="${escapeHtml(team.id)}" title="Add server to ${escapeHtml(team.name)}" aria-label="Add team server">${icons.plus}</button>
+        <button type="button" class="scope-more" data-edit-team="${escapeHtml(team.id)}" title="Rename team" aria-label="Rename team">${icons.more}</button>
+      </div>
+      ${open ? `<div class="team-content">${serverCardsMarkup(servers) || emptyScopeMarkup(query ? "No matching servers" : "No servers in this team")}</div>` : ""}
+    </section>`;
+  }).join("");
+
+  const teamsSection = `<section class="server-scope teams-scope">
+    <div class="scope-heading">
+      <button type="button" class="scope-toggle" data-toggle-scope="teams"><span class="fold-caret ${teamsOpen ? "open" : ""}">${icons.chevron}</span><strong>Team Servers</strong><small>${state.config.teams.length}</small></button>
+      <button type="button" class="scope-add" id="create-team" title="Create team" aria-label="Create team">${icons.plus}</button>
+    </div>
+    ${teamsOpen ? `<div class="scope-content teams-content">${teamSections || `<button type="button" class="empty-team" id="create-first-team"><span>${icons.plus}</span><strong>Create your first team</strong><small>Name a workspace and add shared servers</small></button>`}</div>` : ""}
+  </section>`;
+
+  return personalSection + teamsSection;
 }
 
-function groupMarkup(label: string, servers: Server[]) {
-  if (!servers.length) return "";
-  return `<div class="server-group"><div class="group-label">${label}<span>${servers.length}</span></div>${servers.map(serverCard).join("")}</div>`;
+function serverCardsMarkup(servers: Server[]) {
+  return [...servers].sort((left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite)) || left.name.localeCompare(right.name)).map(serverCard).join("");
+}
+
+function emptyScopeMarkup(message: string) {
+  return `<div class="empty-scope">${escapeHtml(message)}</div>`;
 }
 
 function serverCard(server: Server) {
@@ -554,6 +648,29 @@ function serverCard(server: Server) {
 }
 
 function modalMarkup() {
+  if (state.modal === "account") {
+    return `<div class="modal-backdrop account-backdrop"><section class="modal glass-modal account-modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">SSHKing Cloud</span><h2>${state.cloud.signedIn ? "Your account" : "Log in"}</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">Use one identity across devices and team workspaces. Your SSH passwords and private keys remain on this device.</p>
+      ${cloudAccountMarkup()}
+      <div class="modal-actions"><button type="button" class="ghost" id="account-settings">Cloud settings</button><button type="button" class="ghost modal-close">Close</button></div>
+    </section></div>`;
+  }
+  if (state.modal === "team") {
+    const existing = state.config.teams.find((team) => team.id === state.editingTeamId);
+    return `<div class="modal-backdrop"><form class="modal glass-modal team-modal" id="team-form">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><div><span class="eyebrow">Team workspace</span><h2>${existing ? "Rename team" : "Create a team"}</h2></div><button type="button" class="modal-close">×</button></div>
+      <p class="modal-note">Teams group shared server definitions. Cloud membership and synchronization will plug into this workspace in the next phase.</p>
+      <input type="hidden" name="id" value="${escapeHtml(existing?.id ?? "")}">
+      ${field("Team name", "name", existing?.name ?? "", "text", "Platform, Operations, Client Acme")}
+      <div class="modal-actions">
+        ${existing ? `<button type="button" class="danger" id="delete-team">${icons.trash} Delete team</button>` : "<span></span>"}
+        <div><button type="button" class="ghost modal-close">Cancel</button><button class="primary">${existing ? "Save name" : "Create team"}</button></div>
+      </div>
+    </form></div>`;
+  }
   if (state.modal === "activity") {
     return `<div class="modal-backdrop"><section class="modal glass-modal activity-modal">
       <div class="modal-handle"></div>
@@ -707,6 +824,14 @@ function modalMarkup() {
           </div>
           ${rangeControl("Interface scale", "uiScale", p.uiScale, 80, 140, 5, "%")}
         </section>
+        <section class="settings-section cloud-settings">
+          <div class="settings-section-title"><strong>SSHKing Cloud</strong><small>Sync personal and team servers across devices. SSH credentials always stay local.</small></div>
+          <div class="cloud-url-row">
+            ${field("Cloud server", "cloudUrl", p.cloudUrl ?? "", "url", "https://cloud.example.com", false)}
+            <button type="button" class="history-button compact" id="cloud-check">Check</button>
+          </div>
+          ${cloudAccountMarkup()}
+        </section>
         <div class="settings-columns">
           <section class="settings-section">
             <div class="settings-section-title"><strong>Terminal</strong><small>Text rendering and scrollback</small></div>
@@ -752,6 +877,10 @@ function modalMarkup() {
     <div class="form-grid two">
       ${field("Display name", "name", existing?.name ?? "", "text", "Production")}
       ${field("Group (optional)", "group", existing?.group ?? "", "text", "Work, Personal, Clients", false)}
+      <label class="form-field full"><span>Workspace</span><select name="teamId">
+        <option value="">Personal Servers</option>
+        ${state.config.teams.map((team) => `<option value="${escapeHtml(team.id)}" ${(existing?.teamId ?? state.pendingServerTeamId) === team.id ? "selected" : ""}>${escapeHtml(team.name)} · Team Servers</option>`).join("")}
+      </select></label>
       ${field("Host", "host", existing?.host ?? "", "text", "server.example.com")}
       ${field("User", "user", existing?.user ?? p.defaultUser)}
       ${field("Port", "port", String(existing?.port ?? p.defaultPort), "number")}
@@ -784,6 +913,7 @@ function field(label: string, name: string, value: string, type = "text", placeh
 }
 
 function bindEvents() {
+  document.querySelector("#account-button")?.addEventListener("click", openAccount);
   document.querySelectorAll<HTMLElement>("[data-window]").forEach((button) => button.onclick = () => {
     const action = button.dataset.window;
     if (action === "min") window.runtime?.WindowMinimise();
@@ -804,6 +934,25 @@ function bindEvents() {
     }
     render();
   });
+  document.querySelectorAll<HTMLElement>("[data-toggle-scope]").forEach((button) => button.addEventListener("click", () => {
+    if (button.dataset.toggleScope === "personal") state.personalExpanded = !state.personalExpanded;
+    if (button.dataset.toggleScope === "teams") state.teamsExpanded = !state.teamsExpanded;
+    persistSidebarState();
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>("[data-toggle-team]").forEach((button) => button.addEventListener("click", () => {
+    const teamId = button.dataset.toggleTeam ?? "";
+    if (state.collapsedTeamIds.has(teamId)) state.collapsedTeamIds.delete(teamId);
+    else state.collapsedTeamIds.add(teamId);
+    persistSidebarState();
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>("[data-add-server-team]").forEach((button) => button.addEventListener("click", () => {
+    state.editingId = "";
+    state.pendingServerTeamId = button.dataset.addServerTeam ?? "";
+    openModal("server");
+  }));
+  document.querySelectorAll<HTMLElement>("[data-edit-team]").forEach((button) => button.addEventListener("click", () => openTeamModal(button.dataset.editTeam ?? "")));
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => button.onclick = (event) => {
     if ((event.target as HTMLElement).closest("[data-close-tab]")) return;
     selectTab(button.dataset.tab ?? "");
@@ -825,7 +974,13 @@ function bindEvents() {
   document.querySelector("#toggle-split")?.addEventListener("click", toggleSplitPane);
   const search = document.querySelector<HTMLInputElement>("#server-search");
   search?.addEventListener("input", () => { state.query = search.value; render(); });
-  document.querySelector("#add-server")?.addEventListener("click", () => openModal("server"));
+  document.querySelector("#add-server")?.addEventListener("click", () => {
+    state.editingId = "";
+    state.pendingServerTeamId = "";
+    openModal("server");
+  });
+  document.querySelector("#create-team")?.addEventListener("click", () => openTeamModal());
+  document.querySelector("#create-first-team")?.addEventListener("click", () => openTeamModal());
   document.querySelector("#import-ssh-config")?.addEventListener("click", importSSHConfig);
   document.querySelector("#open-settings")?.addEventListener("click", () => openModal("settings"));
   document.querySelector("#open-activity")?.addEventListener("click", openActivity);
@@ -846,7 +1001,13 @@ function bindEvents() {
   document.querySelectorAll(".modal-close").forEach((button) => button.addEventListener("click", closeModal));
   document.querySelector("#connect-button")?.addEventListener("click", toggleConnection);
   document.querySelector<HTMLFormElement>("#server-form")?.addEventListener("submit", saveServer);
+  document.querySelector<HTMLFormElement>("#team-form")?.addEventListener("submit", saveTeam);
+  document.querySelector("#delete-team")?.addEventListener("click", deleteTeam);
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", saveSettings);
+  document.querySelector("#cloud-check")?.addEventListener("click", () => void refreshCloudState());
+  document.querySelectorAll<HTMLElement>("[data-cloud-login]").forEach((button) => button.addEventListener("click", () => void loginCloud(button.dataset.cloudLogin ?? "")));
+  document.querySelector("#cloud-logout")?.addEventListener("click", () => void logoutCloud());
+  document.querySelector("#account-settings")?.addEventListener("click", () => openModal("settings"));
   const settingsForm = document.querySelector<HTMLFormElement>("#settings-form");
   settingsForm?.addEventListener("input", () => previewSettings(settingsForm));
   settingsForm?.addEventListener("change", () => previewSettings(settingsForm));
@@ -901,6 +1062,70 @@ function themeChoice(value: Preferences["theme"], label: string, description: st
     <span class="theme-preview"><i></i><b></b></span>
     <span><strong>${label}</strong><small>${description}</small></span>
   </label>`;
+}
+
+function cloudAccountMarkup() {
+  if (state.cloudLoading) return `<div class="cloud-account"><span class="cloud-status-dot"></span><span><strong>Contacting cloud…</strong><small>Checking provider and account status</small></span></div>`;
+  if (state.cloud.error) return `<div class="cloud-account cloud-error"><span><strong>Cloud unavailable</strong><small>${escapeHtml(state.cloud.error)}</small></span></div>`;
+  if (state.cloud.signedIn) return `<div class="cloud-account">
+    <span class="cloud-avatar">${escapeHtml((state.cloud.user.displayName || state.cloud.user.email || "U").slice(0, 1).toUpperCase())}</span>
+    <span><strong>${escapeHtml(state.cloud.user.displayName || state.cloud.user.email)}</strong><small>${escapeHtml(state.cloud.user.email)} · session stored in your OS credential vault</small></span>
+    <button type="button" class="ghost cloud-action" id="cloud-logout">Sign out</button>
+  </div>`;
+  const hasURL = Boolean(currentCloudURL());
+  return `<div class="cloud-account cloud-signin"><span><strong>${hasURL ? "Sign in to sync" : "Configure a cloud URL"}</strong><small>${hasURL ? "Providers become available when configured on the server." : "Enter the HTTPS address of your SSHKing cloud server first."}</small></span>
+    <div class="cloud-provider-actions">
+      <button type="button" class="cloud-provider" data-cloud-login="google" ${!state.cloud.providers.google ? "disabled" : ""}>Google</button>
+      <button type="button" class="cloud-provider" data-cloud-login="apple" ${!state.cloud.providers.apple ? "disabled" : ""}>Apple</button>
+    </div>
+  </div>`;
+}
+
+function accountButtonMarkup() {
+  if (state.cloudLoading) return `<button class="account-island loading" id="account-button" type="button"><span class="account-spinner"></span><span>Signing in…</span></button>`;
+  if (!state.cloud.signedIn) return `<button class="account-island signed-out" id="account-button" type="button"><span class="account-icon">↗</span><span>Log in</span></button>`;
+  const displayName = state.cloud.user.displayName || state.cloud.user.email || "Account";
+  return `<button class="account-island signed-in" id="account-button" type="button" title="${escapeHtml(state.cloud.user.email)}">
+    <span class="account-avatar">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</span>
+    <span class="account-label"><small>Logged in as</small><strong>${escapeHtml(displayName)}</strong></span>
+  </button>`;
+}
+
+function openAccount() {
+  state.modal = "account";
+  render();
+  if (state.config.preferences.cloudUrl) void refreshCloudState();
+}
+
+function currentCloudURL() {
+  return String(new FormData(document.querySelector<HTMLFormElement>("#settings-form") ?? document.createElement("form")).get("cloudUrl") ?? state.config.preferences.cloudUrl ?? "").trim().replace(/\/$/, "");
+}
+
+async function refreshCloudState() {
+  const cloudURL = currentCloudURL();
+  if (!cloudURL) {
+    state.cloud = { cloudUrl: "", signedIn: false, user: { id: "", displayName: "", email: "", avatarUrl: "" }, providers: { google: false, apple: false } };
+    return render();
+  }
+  state.config.preferences.cloudUrl = cloudURL;
+  state.cloudLoading = true; state.cloud.error = ""; render();
+  try { state.cloud = await backend("GetCloudState", cloudURL); }
+  catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); }
+  finally { state.cloudLoading = false; if (!state.modal || state.modal === "settings" || state.modal === "account") render(); }
+}
+
+async function loginCloud(provider: string) {
+  const cloudURL = currentCloudURL(); if (!cloudURL || !provider) return;
+  state.cloudLoading = true; state.cloud.error = ""; render();
+  try { state.cloud = await backend("LoginCloud", cloudURL, provider); state.config.preferences.cloudUrl = cloudURL; }
+  catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); }
+  finally { state.cloudLoading = false; if (!state.modal || state.modal === "settings" || state.modal === "account") render(); }
+}
+
+async function logoutCloud() {
+  const cloudURL = currentCloudURL(); if (!cloudURL) return;
+  try { await backend("LogoutCloud", cloudURL); await refreshCloudState(); }
+  catch (error) { state.cloud.error = error instanceof Error ? error.message : String(error); render(); }
 }
 
 function rangeControl(label: string, name: string, value: number, min: number, max: number, step: number, suffix: string) {
@@ -988,6 +1213,14 @@ function openModal(type: "server" | "settings") {
   state.modal = type;
   render();
   setTimeout(() => document.querySelector<HTMLInputElement>(".modal input:not([type=hidden])")?.focus(), 20);
+  if (type === "settings" && state.config.preferences.cloudUrl) void refreshCloudState();
+}
+
+function openTeamModal(teamId = "") {
+  state.editingTeamId = teamId;
+  state.modal = "team";
+  render();
+  setTimeout(() => document.querySelector<HTMLInputElement>('#team-form input[name="name"]')?.focus(), 20);
 }
 
 function closeModal() {
@@ -998,7 +1231,34 @@ function closeModal() {
   }
   state.modal = "";
   state.editingId = "";
+  state.editingTeamId = "";
+  state.pendingServerTeamId = "";
   render();
+}
+
+async function saveTeam(event: SubmitEvent) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget as HTMLFormElement);
+  const team: Team = {
+    id: String(form.get("id") ?? ""),
+    name: String(form.get("name") ?? "").trim(),
+  };
+  state.config = await backend("SaveTeam", team);
+  const saved = state.config.teams.find((item) => item.id === team.id) ?? state.config.teams.at(-1);
+  if (saved) state.collapsedTeamIds.delete(saved.id);
+  state.teamsExpanded = true;
+  persistSidebarState();
+  closeModal();
+}
+
+async function deleteTeam() {
+  if (!state.editingTeamId) return;
+  const deletedId = state.editingTeamId;
+  state.config = await backend("DeleteTeam", deletedId);
+  state.collapsedTeamIds.delete(deletedId);
+  state.personalExpanded = true;
+  persistSidebarState();
+  closeModal();
 }
 
 async function saveServer(event: SubmitEvent) {
@@ -1007,6 +1267,7 @@ async function saveServer(event: SubmitEvent) {
   const existing = state.config.servers.find((server) => server.id === String(form.get("id")));
   const server: Server = {
     id: String(form.get("id") ?? ""),
+    teamId: String(form.get("teamId") ?? ""),
     name: String(form.get("name") ?? ""),
     group: String(form.get("group") ?? ""),
     host: String(form.get("host") ?? ""),
@@ -1023,6 +1284,13 @@ async function saveServer(event: SubmitEvent) {
     requireBiometric: existing?.requireBiometric ?? false,
   };
   state.config = await backend("SaveServer", server);
+  if (server.teamId) {
+    state.teamsExpanded = true;
+    state.collapsedTeamIds.delete(server.teamId);
+  } else {
+    state.personalExpanded = true;
+  }
+  persistSidebarState();
   state.selectedId = server.id || state.config.servers.at(-1)?.id || "";
   const tab = activeTab();
   if (tab && tab.connection === "idle") {
@@ -1040,6 +1308,7 @@ async function saveSettings(event: SubmitEvent) {
   event.preventDefault();
   const form = new FormData(event.currentTarget as HTMLFormElement);
   const preferences: Preferences = {
+    cloudUrl: String(form.get("cloudUrl") ?? "").trim().replace(/\/$/, ""),
     defaultUser: String(form.get("defaultUser") ?? ""),
     defaultPort: Number(form.get("defaultPort") ?? 22),
     defaultShell: String(form.get("defaultShell") ?? "default"),
@@ -1875,6 +2144,7 @@ async function initialise() {
   try {
     const initial = await backend("GetState");
     if (initial?.config) state.config = initial.config;
+    state.config.teams = state.config.teams ?? [];
     state.platform = normalisePlatform(initial?.platform);
     state.biometricAvailable = Boolean(initial?.biometricAvailable);
     state.biometricName = String(initial?.biometricName || "Device authentication");
@@ -1882,12 +2152,15 @@ async function initialise() {
   } catch {
     // Browser preview keeps the representative demo state.
   }
+  state.config.teams = state.config.teams ?? [];
+  restoreSidebarState();
   restoreWorkspace();
   await loadTerminalTranscripts();
   const initialTab = activeTab();
   if (!window.go && initialTab?.serverId === "demo-1") initialTab.remotePath = "/srv/northstar";
   attachRuntimeEvents();
   render();
+  if (state.config.preferences.cloudUrl) void refreshCloudState();
   if (initialTab?.restoreSession && state.config.preferences.reopenActiveSession) {
     requestAnimationFrame(() => void autoConnectTab(initialTab, true));
   }

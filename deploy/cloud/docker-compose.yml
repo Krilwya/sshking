@@ -1,0 +1,47 @@
+services:
+  database:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sshking
+      POSTGRES_USER: sshking
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - sshking_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sshking -d sshking"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [cloud_internal]
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      SSHKING_LISTEN_ADDR: :8080
+      SSHKING_DATABASE_URL: postgres://sshking:${POSTGRES_PASSWORD}@database:5432/sshking?sslmode=disable
+      SSHKING_PUBLIC_URL: ${SSHKING_PUBLIC_URL:-}
+      SSHKING_GOOGLE_CLIENT_ID: ${SSHKING_GOOGLE_CLIENT_ID:-}
+      SSHKING_GOOGLE_CLIENT_SECRET: ${SSHKING_GOOGLE_CLIENT_SECRET:-}
+      SSHKING_APPLE_CLIENT_ID: ${SSHKING_APPLE_CLIENT_ID:-}
+      SSHKING_APPLE_CLIENT_SECRET: ${SSHKING_APPLE_CLIENT_SECRET:-}
+    ports:
+      - "127.0.0.1:8787:8080"
+    networks:
+      cloud_internal:
+      proxy:
+        aliases: [sshking-api]
+
+volumes:
+  sshking_postgres:
+
+networks:
+  cloud_internal:
+    internal: true
+  proxy:
+    external: true
+    name: nginx-reverse_default

@@ -13,6 +13,7 @@ import (
 
 type Server struct {
 	ID               string `json:"id"`
+	TeamID           string `json:"teamId,omitempty"`
 	Name             string `json:"name"`
 	Group            string `json:"group,omitempty"`
 	Host             string `json:"host"`
@@ -29,7 +30,13 @@ type Server struct {
 	RequireBiometric bool   `json:"requireBiometric,omitempty"`
 }
 
+type Team struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type Preferences struct {
+	CloudURL               string `json:"cloudUrl,omitempty"`
 	DefaultUser            string `json:"defaultUser"`
 	DefaultPort            int    `json:"defaultPort"`
 	DefaultShell           string `json:"defaultShell"`
@@ -48,6 +55,7 @@ type Preferences struct {
 
 type Config struct {
 	Servers     []Server    `json:"servers"`
+	Teams       []Team      `json:"teams"`
 	Preferences Preferences `json:"preferences"`
 }
 
@@ -78,7 +86,9 @@ func Default() Config {
 	}
 	return Config{
 		Servers: []Server{},
+		Teams:   []Team{},
 		Preferences: Preferences{
+			CloudURL:               "https://cloud.krilwya.fr",
 			DefaultUser:            user,
 			DefaultPort:            22,
 			DefaultShell:           "default",
@@ -188,6 +198,13 @@ func (s *Store) Activity(limit int) ([]string, error) {
 }
 
 func normalize(cfg *Config) {
+	cfg.Preferences.CloudURL = strings.TrimRight(strings.TrimSpace(cfg.Preferences.CloudURL), "/")
+	if cfg.Servers == nil {
+		cfg.Servers = []Server{}
+	}
+	if cfg.Teams == nil {
+		cfg.Teams = []Team{}
+	}
 	if cfg.Preferences.DefaultPort <= 0 {
 		cfg.Preferences.DefaultPort = 22
 	}
@@ -219,7 +236,17 @@ func normalize(cfg *Config) {
 	if cfg.Preferences.TerminalLineHeight < 100 || cfg.Preferences.TerminalLineHeight > 200 {
 		cfg.Preferences.TerminalLineHeight = 140
 	}
+	teamIDs := make(map[string]struct{}, len(cfg.Teams))
+	for i := range cfg.Teams {
+		cfg.Teams[i].Name = strings.TrimSpace(cfg.Teams[i].Name)
+		teamIDs[cfg.Teams[i].ID] = struct{}{}
+	}
 	for i := range cfg.Servers {
+		if cfg.Servers[i].TeamID != "" {
+			if _, exists := teamIDs[cfg.Servers[i].TeamID]; !exists {
+				cfg.Servers[i].TeamID = ""
+			}
+		}
 		if cfg.Servers[i].Port <= 0 {
 			cfg.Servers[i].Port = 22
 		}

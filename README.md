@@ -7,6 +7,8 @@ system webview.
 ## Current capabilities
 
 - Searchable, persistent server library
+- Foldable Personal Servers and Team Servers workspaces
+- Local team creation, renaming, and server ownership assignment
 - Pure-Go SSH transport (no local `ssh` child process)
 - Configurable remote shell (`default`, `zsh`, `bash`, or `fish`)
 - SSH agent and private-key authentication
@@ -41,3 +43,10 @@ scrollback limit and activity logs stream directly to disk.
 Configuration is stored in the operating system user configuration directory
 under `sshking/config.json`. Activity logs, when enabled, are stored beside it
 in `logs/`.
+
+## Cloud accounts and teams
+
+SSHKing includes an optional self-hosted cloud API for Google/Apple sign-in,
+cross-device server metadata, team membership, and tmux resume/share handles.
+SSH credentials are never uploaded. Deployment files and OAuth callback details
+are in [`deploy/cloud`](deploy/cloud/README.md).
